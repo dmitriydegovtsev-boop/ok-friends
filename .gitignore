@@ -1,0 +1,17 @@
+# личные данные и рабочие файлы программы
+profiles/
+logs/
+counters/
+screenshots/
+settings.json
+do_not_delete.txt
+
+# окружение и сборка
+.venv/
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.pyc
+.DS_Store
+*.log
