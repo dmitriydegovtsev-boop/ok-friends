@@ -65,8 +65,15 @@ def launch_context(pw, account: str):
         if "chrome" in msg and ("not found" in msg or "not installed" in msg or "failed to launch" in msg):
             raise NoChrome() from e
         raise
-    ctx.add_init_script(INIT_SCRIPT)
+    if os.environ.get("OKF_INIT_SCRIPT", "0") == "1":
+        ctx.add_init_script(INIT_SCRIPT)
     ctx.set_default_timeout(15000)
+    # сразу открываем ok.ru, чтобы окно не висело на about:blank
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    try:
+        page.goto(OK_HOME, wait_until="domcontentloaded", timeout=45000)
+    except Exception:
+        pass
     return ctx
 
 

@@ -90,19 +90,35 @@ class AccountDriver(threading.Thread):
                 pass
             self.ctx = None
 
+    def _launch(self):
+        self.status("Открываю Chrome…")
+        self.ctx = browser.launch_context(self.pw, self.account)
+        self.ctx.on("close", lambda *_: setattr(self, "ctx", None))
+
     def _ensure_page(self):
+        """Вернуть живую вкладку; если окно закрыли руками — закрыть остатки и открыть Chrome заново."""
         if self.ctx is None:
-            self.status("Открываю Chrome…")
-            self.ctx = browser.launch_context(self.pw, self.account)
-            self.ctx.on("close", lambda *_: setattr(self, "ctx", None))
-        pages = self.ctx.pages
-        page = pages[0] if pages else self.ctx.new_page()
-        for extra in pages[1:]:
-            try:
-                extra.close()
-            except Exception:
-                pass
-        return page
+            self._launch()
+        try:
+            pages = self.ctx.pages
+            if not pages:
+                raise RuntimeError("browser has been closed: no pages")
+            page = pages[0]
+            for extra in pages[1:]:
+                try:
+                    extra.close()
+                except Exception:
+                    pass
+            page.bring_to_front()
+            return page
+        except Exception as e:
+            if not browser.is_closed_error(e):
+                raise
+            self.log("система", "окно браузера было закрыто, открываю заново")
+            self._close_ctx()
+            self._launch()
+            pages = self.ctx.pages
+            return pages[0] if pages else self.ctx.new_page()
 
     def _execute(self, mode: str) -> None:
         acc = store.account_settings(self.account)

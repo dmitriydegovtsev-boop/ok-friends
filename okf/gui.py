@@ -5,7 +5,7 @@ import random
 import threading
 import tkinter as tk
 import webbrowser
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox
 
 from . import paths, store
 from .worker import AccountDriver
@@ -32,6 +32,22 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(200, self._poll)
         root.after(30000, self._tick_day)
+        self._autostart()
+
+    def _autostart(self):
+        """Служебный автозапуск для проверок: OKF_AUTO="Имя аккаунта:accept|delete|check"."""
+        auto = os.environ.get("OKF_AUTO", "")
+        if ":" not in auto:
+            return
+        name, mode = auto.rsplit(":", 1)
+        if name not in store.account_names():
+            store.update_account(name)
+            self._load_accounts()
+        idx = store.account_names().index(name)
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(idx)
+        self._select_from_list()
+        self.root.after(1000, lambda: self.start(mode, name))
 
     # ---------- интерфейс ----------
     def _build(self):
@@ -176,8 +192,39 @@ class App:
 
     _status: dict = {}
 
+    def _ask_name(self) -> str | None:
+        """Своё окно ввода имени: стандартный simpledialog падает на маке с Tk 9."""
+        win = tk.Toplevel(self.root)
+        win.title("Новый аккаунт")
+        win.resizable(False, False)
+        win.transient(self.root)
+        result = {"name": None}
+        ttk.Label(win, text="Имя аккаунта (как угодно, например «Аккаунт 1»):", padding=(12, 12, 12, 4)).pack(anchor="w")
+        var = tk.StringVar()
+        entry = ttk.Entry(win, textvariable=var, width=32)
+        entry.pack(padx=12, pady=4)
+        row = ttk.Frame(win, padding=(12, 8, 12, 12))
+        row.pack(fill="x")
+
+        def ok(*_):
+            result["name"] = var.get()
+            win.destroy()
+
+        ttk.Button(row, text="ОК", command=ok).pack(side="right")
+        ttk.Button(row, text="Отмена", command=win.destroy).pack(side="right", padx=6)
+        entry.bind("<Return>", ok)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + 200
+        y = self.root.winfo_rooty() + 150
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+        entry.focus_set()
+        self.root.wait_window(win)
+        return result["name"]
+
     def add_account(self):
-        name = simpledialog.askstring("Новый аккаунт", "Имя аккаунта (как угодно, например «Аккаунт 1»):", parent=self.root)
+        name = self._ask_name()
         if not name:
             return
         name = name.strip()
