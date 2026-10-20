@@ -31,14 +31,20 @@ jobs:
       - name: Check that the Playwright driver is inside the exe
         shell: python
         run: |
-          import subprocess, sys
+          import subprocess, sys, pathlib
+          # 1) список всего, что PyInstaller положил в exe (PKG-00.toc), пути приводим к прямым косым
+          toc = pathlib.Path("build/OK-Friends/PKG-00.toc").read_text(encoding="utf-8", errors="replace")
+          toc = toc.replace("\\\\", "/").replace("\\", "/")
+          # 2) и список из самого архива
           out = subprocess.run(
               [sys.executable, "-m", "PyInstaller.utils.cliutils.archive_viewer", "-l", "dist/OK-Friends.exe"],
-              capture_output=True, text=True).stdout
+              capture_output=True, text=True).stdout.replace("\\\\", "/").replace("\\", "/")
           need = ["playwright/driver/node.exe", "playwright/driver/package/cli.js", "playwright/driver/package/lib/server"]
-          missing = [n for n in need if n not in out]
-          print("playwright/driver entries:", out.count("playwright/driver"))
+          print("playwright/driver entries in PKG toc:", toc.count("playwright/driver"))
+          print("playwright/driver entries in archive listing:", out.count("playwright/driver"))
+          missing = [n for n in need if n not in toc and n not in out]
           if missing:
+              print(out[:3000])
               sys.exit("driver files missing from exe: " + ", ".join(missing))
           print("driver ok")
 
