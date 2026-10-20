@@ -46,6 +46,48 @@ MSG_CEILING = "Похоже, достигнут потолок друзей ОК
 MSG_UNCONFIRMED = "Действие не подтвердилось — остановлено, смотрите окно браузера"
 
 
+ACTION_OVERHEAD = {"accept": 3.0, "delete": 9.0}   # само действие: навести, нажать, дождаться ответа (удаление — с перезагрузкой)
+
+
+def mean_pause(rng: tuple) -> float:
+    """Средняя пауза с учётом «задумался» (15 % × ~2 диапазона) и быстрых (5 %)."""
+    lo, hi = rng
+    return 0.05 * lo * 0.85 + 0.15 * hi * 2.0 + 0.80 * (lo + hi) / 2
+
+
+def plan_pace(cap: int, window_s: float, mode: str = "accept") -> dict:
+    """Темп на день: пауза между действиями и перерыв между сессиями по 30–80 действий.
+    До 1000: пауза 3–9 с, перерыв 10–40 мин. Выше 1000: 2–6 с и 2–8 мин.
+    Если планка не укладывается в окно (с запасом 10 %), паузы и перерывы ужимаются
+    пропорционально; пауза не ниже 2 с, перерыв не ниже 1 мин. Время самого действия
+    (ACTION_OVERHEAD) ужать нельзя; если и с полами не укладывается — fits=False."""
+    cap = max(1, int(cap))
+    if cap <= 1000:
+        pause, brk = (3.0, 9.0), (10 * 60.0, 40 * 60.0)
+    else:
+        pause, brk = (2.0, 6.0), (2 * 60.0, 8 * 60.0)
+    sessions = cap / 55.0
+    fixed = cap * ACTION_OVERHEAD.get(mode, 3.0) + (cap / 30) * 12      # действия + отвлечения
+    variable = cap * mean_pause(pause) + sessions * sum(brk) / 2         # паузы + перерывы
+    budget = window_s * 0.9 - fixed
+    scale = 1.0 if variable <= budget else max(0.0, budget / variable)
+    pause = (max(2.0, pause[0] * scale), max(2.4, pause[1] * scale))
+    brk = (max(60.0, brk[0] * scale), max(90.0, brk[1] * scale))
+    expected = fixed + cap * mean_pause(pause) + sessions * sum(brk) / 2
+    return {"pause": pause, "break": brk, "scale": scale, "expected": expected, "fits": expected <= window_s}
+
+
+def draw_pause(rng: tuple) -> float:
+    """Пауза под человека: 80 % обычная в диапазоне, 15 % «задумался» (×1,5–2,5), 5 % быстрая."""
+    lo, hi = rng
+    r = random.random()
+    if r < 0.05:
+        return random.uniform(max(2.0, lo * 0.7), lo)
+    if r < 0.20:
+        return random.uniform(hi, hi * random.uniform(1.5, 2.5))
+    return random.uniform(lo, hi)
+
+
 class Incident(Exception):
     pass
 
@@ -80,9 +122,8 @@ class Session:
         self.cap = store.effective_cap(self.name, mode, acc)
         self.done_run = 0
         self.attempts = 0                   # попыток действия в этом запуске (для проверочного ограничителя)
-        self.actions = 0                    # действий в этом запуске (для перерывов)
-        self.next_short = random.randint(40, 80)
-        self.next_long = random.randint(100, 150)
+        self.actions = 0                    # действий в этом запуске
+        self.session_left = random.randint(30, 80)   # действий до перерыва; новое число каждую сессию
         self.skipped = set()
         self.handled = set()                # уже принятые/удалённые в этом запуске
         self.not_found = 0                  # элемент не нашёлся подряд
@@ -92,7 +133,7 @@ class Session:
         self.max_actions = _env_int("OKF_MAX_ACTIONS", 0)
         self.distract_first = _test_env("OKF_DISTRACT_FIRST") == "1"
         self.fake_fail = _test_env("OKF_FAIL_ACCEPT") == "1"
-        self.base_pause = self._base_pause()
+        self.pace = plan_pace(self.cap, store.window_minutes(acc) * 60, mode)
 
     # ---------- служебное ----------
     def log(self, text: str) -> None:
@@ -104,23 +145,40 @@ class Session:
     def today_done(self) -> int:
         return store.load_counters(self.name)[f"{self.mode}_today"]
 
-    def _base_pause(self) -> float:
-        """Пауза между действиями, чтобы планка уложилась в рабочее окно (не меньше 2 с)."""
-        window = store.window_minutes(self.acc) * 60
-        cap = max(1, self.cap)
-        est = (cap / 60) * 120                       # короткие перерывы
-        est += (cap / 30) * 12                       # отвлечения: каждые 20–40 действий, 4–12 с плюс переходы
-        if cap <= 1000:
-            est += (cap / 125) * 1800                # длинные перерывы
-        return max(2.0, (window - est) / cap)
+    def pace_text(self) -> str:
+        p = self.pace
+        return (f"пауза {p['pause'][0]:.1f}–{p['pause'][1]:.1f} с, сессия 30–80 действий, "
+                f"перерыв {p['break'][0] / 60:.0f}–{p['break'][1] / 60:.0f} мин"
+                + (f", паузы ужаты до {p['scale']:.2f} под окно" if p["scale"] < 1 else "")
+                + ("" if p["fits"] else f"; ВНИМАНИЕ: планка {self.cap} в окно не укладывается "
+                                        f"(нужно ≈ {p['expected'] / 3600:.0f} ч), сделаю сколько успею"))
 
     def pause(self, factor: float = 1.0) -> None:
+        """Пауза между действиями: большинство обычные, иногда «задумался», иногда быстрая; мышь ёрзает."""
         # OKF_PAUSE_SCALE — служебный множитель для проверок (в бою 1.0)
         try:
             scale = float(_test_env("OKF_PAUSE_SCALE", "1"))
         except ValueError:
             scale = 1.0
-        wait(max(2.0, jitter(self.base_pause * factor * scale)), self.stop)
+        seconds = max(2.0, draw_pause(self.pace["pause"]) * factor * scale)
+        if random.random() < 0.35 and seconds > 3:
+            part = random.uniform(0.3, 0.7) * seconds
+            wait(part, self.stop)
+            self.mouse.fidget()
+            wait(seconds - part, self.stop)
+        else:
+            wait(seconds, self.stop)
+
+    def look_around(self) -> None:
+        """Открыл страницу — секунду-три осмотрелся, иногда прокрутил и вернулся."""
+        wait(random.uniform(1.0, 3.0), self.stop)
+        if random.random() < 0.4:
+            d = random.randint(100, 400)
+            self.mouse.scroll(d)
+            wait(random.uniform(0.6, 2.0), self.stop)
+            if random.random() < 0.5:
+                self.mouse.scroll(-d)
+                wait(random.uniform(0.3, 1.0), self.stop)
 
     def body_text(self) -> str:
         """Текст страницы с нормальными пробелами (ОК ставит неразрывные: «Пока нет\\xa0друзей»)."""
@@ -168,7 +226,7 @@ class Session:
         if not store.in_work_window(self.acc):
             self.finish(f"Вне рабочего окна {self.acc['work_start']}–{self.acc['work_end']}")
         if self.today_done() >= self.cap:
-            self.finish(f"Дневная планка {self.cap} достигнута")
+            self.finish("Дневная планка выполнена, продолжу завтра")
         if self.max_actions and self.attempts >= self.max_actions:
             self.finish(f"Проверочный запуск: попыток {self.attempts}, сделано {self.done_run}")
         self.check_page()
@@ -189,21 +247,26 @@ class Session:
         if m:
             self.incident("предупреждение ОК: «" + m.group(0) + "»")
 
-    # ---------- перерывы ----------
+    # ---------- сессии и перерывы ----------
     def breaks(self) -> None:
+        """После действия: сессия 30–80 действий, затем перерыв; оба числа новые каждый раз."""
         self.actions += 1
-        if self.cap <= 1000 and self.actions >= self.next_long:
-            self.next_long = self.actions + random.randint(100, 150)
-            self._break(random.uniform(20 * 60, 40 * 60), "длинный перерыв")
-        elif self.actions >= self.next_short:
-            self.next_short = self.actions + random.randint(40, 80)
-            self._break(random.uniform(60, 180), "короткий перерыв")
-
-    def _break(self, seconds: float, label: str) -> None:
+        self.session_left -= 1
+        if self.session_left > 0:
+            return
+        if self.today_done() >= self.cap:
+            return                           # планка выполнена — перерыв не нужен, guard остановит
+        seconds = random.uniform(*self.pace["break"])
+        try:
+            seconds *= float(_test_env("OKF_PAUSE_SCALE", "1"))
+        except ValueError:
+            pass
         until = (store.now() + timedelta(seconds=seconds)).strftime("%H:%M")
-        self.log(f"{label} {int(seconds // 60)} мин, до {until}")
-        self.status(f"{label.capitalize()} до {until}")
+        self.log(f"сессия закончена ({self.actions} действий за запуск), перерыв {seconds / 60:.0f} мин, до {until}")
+        self.status(f"Перерыв до {until} (сегодня {self.today_done()} из {self.cap})")
         wait(seconds, self.stop)
+        self.session_left = random.randint(30, 80)
+        self.log(f"новая сессия: до {self.session_left} действий")
 
     # ---------- отвлечения ----------
     def want_distraction(self) -> bool:
@@ -300,6 +363,7 @@ class AcceptRun(Session):
             wait(3, self.stop)
             return self.open_list()
         self.not_found = 0
+        self.look_around()
 
     def counter(self) -> str:
         try:
@@ -339,6 +403,16 @@ class AcceptRun(Session):
         except Exception:
             pass
         btn = item.locator(SEL["req_accept"]).first
+        if random.random() < 0.3:
+            # посмотреть, кто это: навести на фото или имя, задержаться
+            look = item.locator(".photo img, " + SEL["req_name"]).first
+            try:
+                self.mouse.hover(look)
+                wait(random.uniform(0.5, 2.0), self.stop)
+            except Stopped:
+                raise
+            except Exception:
+                pass
         shots = _test_env("OKF_SHOTS") == "1"
         if shots:
             btn.scroll_into_view_if_needed()
@@ -397,7 +471,7 @@ class AcceptRun(Session):
 
     def run(self) -> None:
         self.log(f"старт приёма: планка {self.cap}, окно {self.acc['work_start']}–{self.acc['work_end']}, "
-                 f"базовая пауза {self.base_pause:.1f} с, сегодня уже {self.today_done()}")
+                 f"{self.pace_text()}, сегодня уже {self.today_done()}")
         self.status(f"Принимаю заявки (планка {self.cap})")
         self.resolve_urls()
         self.open_list()
@@ -462,6 +536,7 @@ class DeleteRun(Session):
             wait(3, self.stop)
             return self.open_list()
         self.not_found = 0
+        self.look_around()
 
     def counter(self) -> str:
         try:
@@ -628,7 +703,7 @@ class DeleteRun(Session):
 
     def run(self) -> None:
         self.log(f"старт удаления: планка {self.cap}, окно {self.acc['work_start']}–{self.acc['work_end']}, "
-                 f"базовая пауза {self.base_pause:.1f} с, сегодня уже {self.today_done()}, "
+                 f"{self.pace_text()}, сегодня уже {self.today_done()}, "
                  f"не трогать: {len(self.keep)} записей")
         self.status(f"Удаляю друзей (планка {self.cap})")
         self.resolve_urls()

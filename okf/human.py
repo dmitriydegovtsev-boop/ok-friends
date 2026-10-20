@@ -90,10 +90,45 @@ class Mouse:
         y = box["y"] + box["height"] * random.uniform(0.25, 0.75)
         return x, y
 
-    def hover(self, locator) -> dict:
+    def ensure_visible(self, locator) -> dict:
+        """Докрутить колесом кусками, пока элемент не окажется в видимой области (без мгновенного scrollIntoView)."""
+        try:
+            height = self.page.evaluate("() => window.innerHeight")
+        except Exception:
+            height = 800
+        for _ in range(25):
+            if self.stop.is_set():
+                raise Stopped()
+            box = locator.bounding_box()
+            if box is None:
+                break
+            top, bottom = box["y"], box["y"] + box["height"]
+            if top >= 90 and bottom <= height - 60:
+                return box
+            if bottom > height - 60:
+                self.page.mouse.wheel(0, min(random.randint(150, 450), int(bottom - height + random.randint(120, 260))))
+            else:
+                self.page.mouse.wheel(0, -min(random.randint(150, 450), int(random.randint(120, 260) - top)))
+            time.sleep(random.uniform(0.15, 0.5))
+        # запасной путь: стандартная прокрутка
         locator.scroll_into_view_if_needed(timeout=5000)
+        time.sleep(random.uniform(0.2, 0.5))
+        return locator.bounding_box()
+
+    def fidget(self) -> None:
+        """Мелкое движение мыши на месте: человек ёрзает, пока думает."""
+        x = self.pos[0] + random.uniform(-60, 60)
+        y = self.pos[1] + random.uniform(-40, 40)
+        try:
+            self._glide(max(5, x), max(5, y))
+        except Stopped:
+            raise
+        except Exception:
+            pass
+
+    def hover(self, locator) -> dict:
+        box = self.ensure_visible(locator)
         time.sleep(random.uniform(0.1, 0.4))
-        box = locator.bounding_box()
         if not box:
             raise LookupError("элемент без координат")
         self.move_to(*self.point_in(box))
