@@ -109,11 +109,9 @@ class Session:
         window = store.window_minutes(self.acc) * 60
         cap = max(1, self.cap)
         est = (cap / 60) * 120                       # короткие перерывы
+        est += (cap / 30) * 12                       # отвлечения: каждые 20–40 действий, 4–12 с плюс переходы
         if cap <= 1000:
             est += (cap / 125) * 1800                # длинные перерывы
-            est += (cap / 6) * 15                    # отвлечения
-        else:
-            est += (cap / 20) * 15
         return max(2.0, (window - est) / cap)
 
     def pause(self, factor: float = 1.0) -> None:
@@ -209,18 +207,16 @@ class Session:
 
     # ---------- отвлечения ----------
     def want_distraction(self) -> bool:
+        """Отвлечение через случайные 20–40 действий; интервал разыгрывается заново каждый раз."""
         if self.distract_first and self.actions == 0:
             self.distract_first = False
-            self.last_was_distraction = True
             return True
-        if getattr(self, "last_was_distraction", False):
-            # два отвлечения подряд не делаем — между ними должно быть действие
-            self.last_was_distraction = False
-            return False
-        k = random.randint(4, 8) if self.cap <= 1000 else random.randint(15, 25)
-        want = random.random() < 1.0 / k
-        self.last_was_distraction = want
-        return want
+        if not hasattr(self, "next_distraction"):
+            self.next_distraction = self.actions + random.randint(20, 40)
+        if self.actions >= self.next_distraction:
+            self.next_distraction = self.actions + random.randint(20, 40)
+            return True
+        return False
 
     def distract(self, uid: str) -> None:
         if random.random() < 0.08:
@@ -231,10 +227,11 @@ class Session:
         self.page.goto(f"{OK}/profile/{uid}", wait_until="domcontentloaded", timeout=45000)
         wait(random.uniform(1.5, 3.0), self.stop)
         self.check_page()
-        dwell = random.uniform(5, 25)
+        dwell = random.uniform(4, 12)
         t0 = time.monotonic()
         self.mouse.scroll(random.randint(300, 1200))
-        if random.random() < 0.5:
+        # вероятность полистать фото сама случайна: от 1 из 3 до 1 из 5, каждый раз заново
+        if random.random() < 1.0 / random.uniform(3, 5):
             self._browse_photos()
         left = dwell - (time.monotonic() - t0)
         if left > 0:
