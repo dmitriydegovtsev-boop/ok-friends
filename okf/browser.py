@@ -1,6 +1,7 @@
 """Запуск настоящего Google Chrome с персистентным профилем и проверка входа в ОК."""
 import os
 import sys
+import time
 from pathlib import Path
 
 from . import paths
@@ -39,12 +40,35 @@ def find_chrome() -> str | None:
 INIT_SCRIPT = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
 
 
+def kill_stale_chrome(account: str) -> int:
+    """Добить процессы Chrome, запущенные с профилем этого аккаунта (окно закрыли, а процесс остался).
+    Чужие Chrome не трогаем: ищем только по пути нашего профиля."""
+    profile = str(paths.PROFILES / paths.safe_name(account))
+    killed = 0
+    try:
+        import psutil
+    except ImportError:
+        return 0
+    for proc in psutil.process_iter(["cmdline"]):
+        try:
+            cmd = proc.info.get("cmdline") or []
+            if any(f"--user-data-dir={profile}" == a or a.startswith(f"--user-data-dir={profile}") for a in cmd):
+                proc.kill()
+                killed += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    if killed:
+        time.sleep(1.5)
+    return killed
+
+
 def launch_context(pw, account: str):
     """Открыть видимый Chrome с профилем profiles/<аккаунт>. Бросает NoChrome, если Chrome нет."""
     if not find_chrome():
         raise NoChrome()
     profile = paths.PROFILES / paths.safe_name(account)
     profile.mkdir(parents=True, exist_ok=True)
+    kill_stale_chrome(account)
     try:
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(profile),

@@ -211,9 +211,16 @@ class Session:
     def want_distraction(self) -> bool:
         if self.distract_first and self.actions == 0:
             self.distract_first = False
+            self.last_was_distraction = True
             return True
+        if getattr(self, "last_was_distraction", False):
+            # два отвлечения подряд не делаем — между ними должно быть действие
+            self.last_was_distraction = False
+            return False
         k = random.randint(4, 8) if self.cap <= 1000 else random.randint(15, 25)
-        return random.random() < 1.0 / k
+        want = random.random() < 1.0 / k
+        self.last_was_distraction = want
+        return want
 
     def distract(self, uid: str) -> None:
         if random.random() < 0.08:
@@ -344,6 +351,13 @@ class AcceptRun(Session):
             wait(1, self.stop)
             self.log(f"проверка: «Принять» для {name} ({uid}) имитирую как несработавшее")
             return False
+        if _test_env("OKF_FAKE_UNCONFIRMED") == "1":
+            # проверка: навели, но не нажали — ответа ОК не будет, результат «не подтверждён»
+            self.mouse.hover(btn)
+            wait(1, self.stop)
+            self.log(f"проверка: «Принять» для {name} ({uid}) без нажатия — имитирую неподтверждённое действие")
+            self.ok_error = False
+            return False
         self.mouse.click(btn)
         # ждём до 10 с: карточка перерисовывается — ищем её заново по id;
         # успех = кнопки «Принять» нет и видна надпись «Заявка принята» (или карточка исчезла)
@@ -458,6 +472,51 @@ class DeleteRun(Session):
         except Exception:
             return "?"
 
+    def dismiss_banners(self) -> None:
+        """Рекламные плашки ОК (например, «#МагнитныеИсторииОК») перекрывают карточки.
+        Один раз за запуск пробуем кнопку «Скрыть»; дальше спасает сдвиг страницы (см. uncover)."""
+        if getattr(self, "banner_tried", False):
+            return
+        self.banner_tried = True
+        try:
+            btns = self.page.get_by_role("button", name="Скрыть", exact=True)
+            if btns.count() and btns.first.is_visible():
+                self.log("закрываю плашку кнопкой «Скрыть»")
+                self.mouse.click(btns.first)
+                wait(random.uniform(0.6, 1.2), self.stop)
+        except Stopped:
+            raise
+        except Exception:
+            pass
+
+    def uncover(self, target) -> None:
+        """Если аватар перекрыт фиксированной плашкой, прокрутить страницу, чтобы карточка ушла из-под неё."""
+        for _ in range(3):
+            try:
+                target.scroll_into_view_if_needed(timeout=5000)
+                box = target.bounding_box()
+                banners = self.page.locator("[class*='fixed_promo'], [class*='fixed-promo']")
+                overlap = False
+                for i in range(banners.count()):
+                    b = banners.nth(i)
+                    if not b.is_visible():
+                        continue
+                    bb = b.bounding_box()
+                    if not box or not bb:
+                        continue
+                    if box["x"] < bb["x"] + bb["width"] and box["x"] + box["width"] > bb["x"] and \
+                            box["y"] < bb["y"] + bb["height"] and box["y"] + box["height"] > bb["y"]:
+                        overlap = True
+                if not overlap:
+                    return
+                self.log("карточку перекрывает плашка, сдвигаю страницу")
+                self.mouse.scroll(random.randint(250, 400))
+                wait(random.uniform(0.5, 1.0), self.stop)
+            except Stopped:
+                raise
+            except Exception:
+                return
+
     def candidates(self) -> list:
         items = self.page.locator(SEL["fr_item"])
         out = []
@@ -498,13 +557,28 @@ class DeleteRun(Session):
         if shots:
             card.scroll_into_view_if_needed()
             self.screenshot(f"before_{uid}")
-        # 1) навести на аватар — всплывает меню
-        self.mouse.hover(card.locator(SEL["fr_avatar"]).first)
+        # 1) навести на аватар — всплывает меню; если не всплыло, отвести мышь и навести ещё раз
         item = self.page.locator(SEL["fr_menu_remove"]).first
-        try:
-            item.wait_for(state="visible", timeout=6000)
-        except Exception:
-            self.log(f"меню «Прекратить дружбу» не появилось для {name} ({uid})")
+        shown = False
+        for attempt in range(2):
+            self.dismiss_banners()
+            self.uncover(card.locator(SEL["fr_avatar"]).first)
+            if attempt:
+                # карточку могла закрыть плашка: сдвигаем страницу и наводим заново
+                self.mouse.scroll(random.randint(200, 350))
+                self.mouse.move_to(self.mouse.pos[0] + random.randint(-250, 250), self.mouse.pos[1] + random.randint(120, 300))
+                wait(random.uniform(0.8, 1.5), self.stop)
+            self.mouse.hover(card.locator(SEL["fr_avatar"]).first)
+            wait(random.uniform(0.3, 0.8), self.stop)
+            try:
+                item.wait_for(state="visible", timeout=6000)
+                shown = True
+                break
+            except Exception:
+                continue
+        if not shown:
+            self.log(f"меню «Прекратить дружбу» не появилось для {name} ({uid}) после двух наведений")
+            self.screenshot("no_menu")
             self.miss += 1
             if self.miss >= 2:
                 self.incident("меню друга не нашлось дважды подряд")
@@ -562,14 +636,29 @@ class DeleteRun(Session):
         self.status(f"Удаляю друзей (планка {self.cap})")
         self.resolve_urls()
         self.open_list()
+        self.failed = set()                 # меню/окно не открылось в этом запуске
+        retried = False
         while True:
             self.guard()
             uid = self.pick()
             if uid is None:
                 self.open_list()
                 uid = self.pick()
-                if uid is None:
-                    self.finish("Друзья кончились (или остались только из do_not_delete.txt)")
+            if uid is None and self.skipped:
+                self.log(f"список пройден, возвращаюсь к пропущенным ({len(self.skipped)})")
+                self.skipped.clear()
+                continue
+            if uid is None and self.failed and not retried:
+                retried = True
+                self.log(f"список пройден, повторная попытка для тех, у кого не открылось меню ({len(self.failed)})")
+                self.handled -= self.failed
+                self.failed.clear()
+                continue
+            if uid is None:
+                total = self.page.locator(SEL["fr_item"]).count()
+                if total == 0:
+                    self.finish("Друзья кончились")
+                self.finish(f"Список пройден: осталось {total}, их не трогаем (do_not_delete.txt или меню не открылось)")
             if random.random() < 1 / 15:
                 self.skipped.add(uid)
                 self.log(f"пропускаю {uid}")
@@ -591,6 +680,7 @@ class DeleteRun(Session):
             else:
                 # сюда попадаем только если меню/окно не нашлись (действия не было); второй промах — инцидент
                 self.handled.add(uid)
+                self.failed.add(uid)
                 self.open_list()
             self.pause()
 

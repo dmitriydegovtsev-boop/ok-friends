@@ -71,9 +71,10 @@ class AccountDriver(threading.Thread):
                     self.status("Установите Google Chrome")
                 except Exception as e:
                     if browser.is_closed_error(e):
-                        self.ctx = None
+                        # окно закрыли руками: закрываем остатки Chrome, иначе он без окон держит профиль
+                        self._close_ctx()
                         self.status(MSG_CLOSED)
-                        self.log(cmd, "окно браузера закрыто руками")
+                        self.log(cmd, "окно браузера закрыто руками (" + " ".join(str(e).split())[:100] + ")")
                     else:
                         self.log(cmd, "ошибка: " + " ".join(str(e).split())[:300])
                         self.status("Ошибка: " + " ".join(str(e).split())[:120])
@@ -83,12 +84,13 @@ class AccountDriver(threading.Thread):
                     self.refresh()
 
     def _close_ctx(self) -> None:
-        if self.ctx is not None:
+        ctx, self.ctx = self.ctx, None
+        if ctx is not None:
             try:
-                self.ctx.close()
+                ctx.close()
             except Exception:
                 pass
-            self.ctx = None
+        browser.kill_stale_chrome(self.account)
 
     def _launch(self):
         self.status("Открываю Chrome…")
