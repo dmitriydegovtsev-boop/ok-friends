@@ -51,6 +51,84 @@ def main():
                 page.goto(sys.argv[2], wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(1500)
                 print(page.evaluate(sys.argv[3]))
+            elif cmd == "mark":
+                # mark <url> <png> <css1> [<css2> ...] — обвести найденные элементы и снять скриншот
+                url, png = sys.argv[2], sys.argv[3]
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+                colors = ["red", "blue", "green", "magenta", "orange"]
+                for i, css in enumerate(sys.argv[4:]):
+                    loc = page.locator(css)
+                    vis = [loc.nth(k) for k in range(loc.count()) if loc.nth(k).is_visible()]
+                    print(f"[{colors[i % 5]}] {css} -> всего {loc.count()}, видимых {len(vis)}")
+                    for el in vis:
+                        el.evaluate("(e, c) => { e.style.outline = '3px solid ' + c; e.style.outlineOffset = '2px'; }",
+                                    colors[i % 5])
+                page.screenshot(path=str(OUT / png), full_page=False)
+            elif cmd == "phototest":
+                page.goto(sys.argv[2], wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+                thumbs = page.locator("#hook_Block_UserPagePortletPhotos a.photo[href*='PopLayerPhoto']")
+                print("thumbs:", thumbs.count())
+                thumbs.first.click()
+                page.wait_for_timeout(2500)
+                page.screenshot(path=str(OUT / "photo1.png"))
+                print("layer:", page.locator(".photo-layer").count(), page.locator("#hook_Block_PhotoLayer").count())
+                page.keyboard.press("ArrowRight")
+                page.wait_for_timeout(2000)
+                page.screenshot(path=str(OUT / "photo2.png"))
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(1500)
+                page.screenshot(path=str(OUT / "photo3.png"))
+                print("after esc layer:", page.locator(".photo-layer").count(), "url:", page.url)
+            elif cmd == "friendmenu":
+                page.goto(sys.argv[2], wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+                cards = page.locator(".user-grid-card[data-id]")
+                print("cards:", cards.count())
+                card = cards.first
+                card.hover()
+                page.wait_for_timeout(1500)
+                page.screenshot(path=str(OUT / "fmenu1.png"))
+                trig = card.locator(".user-grid-card_menu-button-trigger")
+                print("trigger:", trig.count(), "visible:", trig.first.is_visible())
+                trig.first.click()
+                page.wait_for_timeout(2500)
+                page.screenshot(path=str(OUT / "fmenu2.png"))
+                menu = page.locator("xpath=//*[contains(normalize-space(.),'Удалить из друзей') and string-length(normalize-space(.)) < 30]")
+                print("remove items:", menu.count())
+                for i in range(menu.count()):
+                    el = menu.nth(i)
+                    print("visible:", el.is_visible(), "|", el.evaluate("e => e.outerHTML")[:600])
+                cont = menu.first.locator("xpath=ancestor::*[contains(@class,'sc-menu') or contains(@class,'menu')][1]")
+                if cont.count():
+                    print("----- menu container -----")
+                    print(cont.first.evaluate("e => e.outerHTML")[:3000])
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(1000)
+                page.screenshot(path=str(OUT / "fmenu3.png"))
+            elif cmd == "friendmenu2":
+                page.goto(sys.argv[2], wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+                card = page.locator(".user-grid-card[data-id]").first
+                card.locator(".user-grid-card_img").first.hover()
+                page.wait_for_timeout(2000)
+                item = page.locator("xpath=//*[normalize-space(.)='Прекратить дружбу']")
+                print("items:", item.count())
+                for i in range(item.count()):
+                    el = item.nth(i)
+                    print("visible:", el.is_visible(), "tag:", el.evaluate("e => e.tagName"), "|",
+                          el.evaluate("e => e.outerHTML")[:500])
+                cont = item.first.locator(
+                    "xpath=ancestor::*[contains(@class,'sc-menu') or contains(@class,'tip') or contains(@class,'popup')][1]")
+                print("container count:", cont.count())
+                if cont.count():
+                    print(cont.first.evaluate("e => e.outerHTML")[:2500])
+                tabs = page.locator("a.nav_menu_tab")
+                for i in range(tabs.count()):
+                    t = tabs.nth(i)
+                    print("TAB", t.get_attribute("data-l"), "|", t.get_attribute("href"), "|",
+                          t.inner_text().replace("\n", " "))
             elif cmd == "dump":
                 url, css = sys.argv[2], sys.argv[3]
                 limit = int(sys.argv[4]) if len(sys.argv) > 4 else 3
