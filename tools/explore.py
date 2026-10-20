@@ -129,6 +129,99 @@ def main():
                     t = tabs.nth(i)
                     print("TAB", t.get_attribute("data-l"), "|", t.get_attribute("href"), "|",
                           t.inner_text().replace("\n", " "))
+            elif cmd == "unfriend_dialog":
+                page.goto(sys.argv[2], wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+                card = page.locator(".user-grid-card[data-id]").first
+                print("card:", card.get_attribute("data-id"))
+                card.hover()
+                page.wait_for_timeout(1500)
+                item = page.locator(".sc-menu:not(.sc-menu__hidden) a.u-menu_a[aria-label='Прекратить дружбу']")
+                print("visible menu items:", item.count())
+                page.screenshot(path=str(OUT / "unfriend1.png"))
+                box = item.first.bounding_box()
+                print("item box:", box)
+                page.mouse.move(box["x"] + box["width"] * 0.4, box["y"] + box["height"] / 2, steps=15)
+                page.wait_for_timeout(400)
+                page.mouse.down()
+                page.wait_for_timeout(80)
+                page.mouse.up()
+                page.wait_for_timeout(2500)
+                page.screenshot(path=str(OUT / "unfriend2.png"))
+                layer = page.locator("xpath=//*[contains(@id,'PopLayer') or contains(@class,'modal') or contains(@class,'layer')]"
+                                     "[.//*[contains(normalize-space(.),'друж') or contains(normalize-space(.),'друз')]]")
+                print("layers:", layer.count())
+                for i in range(layer.count()):
+                    el = layer.nth(i)
+                    if el.is_visible():
+                        html = el.evaluate("e => e.outerHTML")
+                        if len(html) < 8000:
+                            print(f"----- visible layer [{i}] -----")
+                            print(html)
+                            break
+                btns = page.locator("button:visible, a.button-pro:visible, [role=button]:visible")
+                for i in range(btns.count()):
+                    b = btns.nth(i)
+                    txt = b.inner_text().strip().replace("\n", " ")
+                    if txt:
+                        print("BTN", repr(txt[:40]), "|", b.evaluate("e => e.className")[:80])
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(1500)
+                page.screenshot(path=str(OUT / "unfriend3.png"))
+                print("cards after:", page.locator(".user-grid-card[data-id]").count())
+            elif cmd == "hovertest":
+                import threading
+                from okf.human import Mouse
+                page.goto(sys.argv[2], wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+                m = Mouse(page, threading.Event())
+                card = page.locator(".user-grid-card[data-id]").first
+                uid = card.get_attribute("data-id")
+                menu = page.locator(f".sc-menu:not(.sc-menu__hidden) a.u-menu_a[aria-label='Прекратить дружбу'][href*='userIds={uid}']")
+                for css in sys.argv[3:]:
+                    page.mouse.move(600, 650)
+                    page.wait_for_timeout(1500)
+                    print(css, "-> before:", menu.count(), end=" ")
+                    m.hover(card.locator(css).first if css != "card" else card)
+                    page.wait_for_timeout(2500)
+                    print("after:", menu.count())
+                    page.screenshot(path=str(OUT / f"hover_{css.strip('.').replace(' ', '_')[:20]}.png"))
+            elif cmd == "hovertest2":
+                import threading
+                from okf.human import Mouse
+                page.goto(sys.argv[2], wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+                card = page.locator(".user-grid-card[data-id]").first
+                card.scroll_into_view_if_needed()
+                page.wait_for_timeout(500)
+                uid = card.get_attribute("data-id")
+                menu = page.locator(".sc-menu:not(.sc-menu__hidden) a.u-menu_a[aria-label='Прекратить дружбу']")
+                box = card.bounding_box()
+                cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+                print("card box:", box, "uid:", uid)
+                print("elementFromPoint center:", page.evaluate("([x,y]) => { const e = document.elementFromPoint(x,y); return e ? e.tagName + '.' + e.className : null }", [cx, cy]))
+                def reset():
+                    page.mouse.move(600, 700, steps=3)
+                    page.wait_for_timeout(1500)
+                reset()
+                page.mouse.move(cx, cy, steps=1)
+                page.wait_for_timeout(2500)
+                print("A steps=1 ->", menu.count())
+                reset()
+                page.mouse.move(cx, cy, steps=25)
+                page.wait_for_timeout(2500)
+                print("B steps=25 ->", menu.count())
+                reset()
+                m = Mouse(page, threading.Event())
+                m.pos = (600, 700)
+                m.move_to(cx, cy)
+                page.wait_for_timeout(2500)
+                print("C human ->", menu.count())
+                page.screenshot(path=str(OUT / "hover_c.png"))
+                reset()
+                card.hover()
+                page.wait_for_timeout(2500)
+                print("D locator.hover ->", menu.count())
             elif cmd == "dump":
                 url, css = sys.argv[2], sys.argv[3]
                 limit = int(sys.argv[4]) if len(sys.argv) > 4 else 3

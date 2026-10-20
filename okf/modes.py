@@ -2,6 +2,7 @@
 import os
 import random
 import re
+import sys
 import time
 from datetime import timedelta
 
@@ -21,11 +22,17 @@ SEL = {
     "req_empty_text": "Пока нет входящих заявок",
     # профиль человека
     "photo_thumbs": "#hook_Block_UserPagePortletPhotos a.photo[href*='PopLayerPhoto']",
-    # список друзей (заполняется на шаге Г)
-    "fr_item": "",
-    "fr_menu": "",
-    "fr_remove": "",
-    "fr_confirm": "",
+    # список друзей
+    "fr_list": "[data-block='MyFriendsSquareCardsPagingB']",
+    "fr_item": "[data-block='MyFriendsSquareCardsPagingB'] .user-grid-card[data-id]",
+    "fr_avatar": ".user-grid-card_img",
+    "fr_name": ".user-grid-card_name a",
+    "fr_menu_remove": ".sc-menu:not(.sc-menu__hidden) a.u-menu_a[aria-label='Прекратить дружбу']",
+    "fr_modal": "#hook_Modal_popLayerModal",
+    "fr_modal_uid": "#hook_Modal_popLayerModal #field_userIds",
+    "fr_confirm": "#hook_Modal_popLayerModal #hook_FormButton_button_delete_confirm",
+    "fr_counter": "a[data-l='t,userFriend'] .nav_menu_tab-counter",
+    "fr_empty_text": "Пока нет друзей",
 }
 
 OK = "https://ok.ru"
@@ -46,9 +53,16 @@ class Finished(Exception):
     """Штатная остановка: заявки кончились, планка, окно, потолок."""
 
 
+def _test_env(name: str, default: str = "") -> str:
+    """Служебные переменные OKF_* работают только при запуске из исходников, в .exe — никогда."""
+    if getattr(sys, "frozen", False):
+        return default
+    return os.environ.get(name, default)
+
+
 def _env_int(name: str, default: int) -> int:
     try:
-        return int(os.environ.get(name, default))
+        return int(_test_env(name, str(default)))
     except ValueError:
         return default
 
@@ -64,6 +78,7 @@ class Session:
         self.mouse = Mouse(page, self.stop)
         self.cap = store.effective_cap(self.name, mode, acc)
         self.done_run = 0
+        self.attempts = 0                   # попыток действия в этом запуске (для проверочного ограничителя)
         self.actions = 0                    # действий в этом запуске (для перерывов)
         self.next_short = random.randint(40, 80)
         self.next_long = random.randint(100, 150)
@@ -74,8 +89,8 @@ class Session:
         self.urls = {}
         # служебные ограничители для проверок
         self.max_actions = _env_int("OKF_MAX_ACTIONS", 0)
-        self.distract_first = os.environ.get("OKF_DISTRACT_FIRST") == "1"
-        self.fake_fail = os.environ.get("OKF_FAIL_ACCEPT") == "1"
+        self.distract_first = _test_env("OKF_DISTRACT_FIRST") == "1"
+        self.fake_fail = _test_env("OKF_FAIL_ACCEPT") == "1"
         self.base_pause = self._base_pause()
 
     # ---------- служебное ----------
@@ -101,7 +116,12 @@ class Session:
         return max(2.0, (window - est) / cap)
 
     def pause(self, factor: float = 1.0) -> None:
-        wait(jitter(self.base_pause * factor), self.stop)
+        # OKF_PAUSE_SCALE — служебный множитель для проверок (в бою 1.0)
+        try:
+            scale = float(_test_env("OKF_PAUSE_SCALE", "1"))
+        except ValueError:
+            scale = 1.0
+        wait(max(2.0, jitter(self.base_pause * factor * scale)), self.stop)
 
     def screenshot(self, tag: str) -> str:
         stamp = store.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -137,8 +157,8 @@ class Session:
             self.finish(f"Вне рабочего окна {self.acc['work_start']}–{self.acc['work_end']}")
         if self.today_done() >= self.cap:
             self.finish(f"Дневная планка {self.cap} достигнута")
-        if self.max_actions and self.done_run >= self.max_actions:
-            self.finish(f"Проверочный запуск: сделано {self.done_run}")
+        if self.max_actions and self.attempts >= self.max_actions:
+            self.finish(f"Проверочный запуск: попыток {self.attempts}, сделано {self.done_run}")
         self.check_page()
 
     def check_page(self) -> None:
@@ -302,7 +322,7 @@ class AcceptRun(Session):
         except Exception:
             pass
         btn = item.locator(SEL["req_accept"]).first
-        shots = os.environ.get("OKF_SHOTS") == "1"
+        shots = _test_env("OKF_SHOTS") == "1"
         if shots:
             btn.scroll_into_view_if_needed()
             self.screenshot(f"before_{uid}")
@@ -371,6 +391,7 @@ class AcceptRun(Session):
                 self.distract(uid)
                 self.open_list()
                 continue
+            self.attempts += 1
             ok = self.accept_one(item, uid)
             if ok:
                 self.handled.add(uid)
@@ -393,8 +414,170 @@ class AcceptRun(Session):
 # ======================= УДАЛЕНИЕ ДРУЗЕЙ =======================
 
 class DeleteRun(Session):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.keep = store.read_do_not_delete()
+        self.miss = 0                       # элемент (меню, окно) не нашёлся подряд
+
+    def open_list(self) -> None:
+        self.page.goto(self.urls["friends"], wait_until="domcontentloaded", timeout=45000)
+        wait(random.uniform(1.5, 3.0), self.stop)
+        self.check_page()
+        if self.page.locator(SEL["fr_list"]).count() == 0:
+            if SEL["fr_empty_text"] in self.page.locator("body").inner_text(timeout=5000):
+                self.finish("Друзья кончились")
+            self.not_found += 1
+            if self.not_found >= 2:
+                self.incident("не нашёл список друзей (незнакомая страница)")
+            self.log("список друзей не нашёлся, пробую ещё раз")
+            wait(3, self.stop)
+            return self.open_list()
+        self.not_found = 0
+
+    def counter(self) -> str:
+        try:
+            return self.page.locator(SEL["fr_counter"]).first.inner_text(timeout=2000).strip()
+        except Exception:
+            return "?"
+
+    def candidates(self) -> list:
+        items = self.page.locator(SEL["fr_item"])
+        out = []
+        for i in range(items.count()):
+            uid = items.nth(i).get_attribute("data-id") or ""
+            if not uid or uid in self.handled or uid in self.skipped:
+                continue
+            if uid in self.keep or f"https://ok.ru/profile/{uid}" in self.keep:
+                continue
+            out.append(uid)
+        return out
+
+    def pick(self) -> str | None:
+        """Случайный человек из списка: иногда сначала прокручиваем, чтобы брать не только сверху."""
+        for _ in range(random.randint(0, 3)):
+            self.mouse.scroll(random.randint(500, 1500))
+            wait(random.uniform(0.8, 2.0), self.stop)
+        cands = self.candidates()
+        if not cands:
+            # дошли до конца видимого — попробуем догрузить
+            before = self.page.locator(SEL["fr_item"]).count()
+            for _ in range(3):
+                self.mouse.scroll(random.randint(800, 1600))
+                wait(random.uniform(1.0, 2.5), self.stop)
+                if self.page.locator(SEL["fr_item"]).count() > before:
+                    break
+            cands = self.candidates()
+        return random.choice(cands) if cands else None
+
+    def delete_one(self, uid: str) -> bool:
+        card = self.page.locator(f"{SEL['fr_item']}[data-id='{uid}']").first
+        name = ""
+        try:
+            name = card.locator(SEL["fr_name"]).first.inner_text(timeout=3000).strip()
+        except Exception:
+            pass
+        shots = _test_env("OKF_SHOTS") == "1"
+        if shots:
+            card.scroll_into_view_if_needed()
+            self.screenshot(f"before_{uid}")
+        # 1) навести на аватар — всплывает меню
+        self.mouse.hover(card.locator(SEL["fr_avatar"]).first)
+        item = self.page.locator(SEL["fr_menu_remove"]).first
+        try:
+            item.wait_for(state="visible", timeout=6000)
+        except Exception:
+            self.log(f"меню «Прекратить дружбу» не появилось для {name} ({uid})")
+            self.miss += 1
+            if self.miss >= 2:
+                self.incident("меню друга не нашлось дважды подряд")
+            return False
+        wait(random.uniform(0.4, 1.2), self.stop)
+        # 2) пункт «Прекратить дружбу» — клик по координатам, меню прячется при уходе мыши
+        box = item.bounding_box()
+        if not box:
+            self.miss += 1
+            if self.miss >= 2:
+                self.incident("пункт меню без координат дважды подряд")
+            return False
+        self.mouse.click_box(box)
+        # 3) окно подтверждения именно для этого человека
+        try:
+            self.page.locator(f"{SEL['fr_modal_uid']}[value='{uid}']").wait_for(state="attached", timeout=8000)
+            self.page.locator(SEL["fr_confirm"]).wait_for(state="visible", timeout=8000)
+        except Exception:
+            self.log(f"окно подтверждения не появилось для {name} ({uid})")
+            self.screenshot("no_confirm")
+            self.miss += 1
+            if self.miss >= 2:
+                self.incident("окно подтверждения не появилось дважды подряд")
+            return False
+        self.miss = 0
+        wait(random.uniform(0.6, 1.8), self.stop)
+        if shots:
+            self.screenshot(f"confirm_{uid}")
+        self.mouse.click(self.page.locator(SEL["fr_confirm"]).first)
+        # 4) ждём, пока окно подтверждения закроется (до 10 с)
+        for _ in range(20):
+            wait(0.5, self.stop)
+            try:
+                if not self.page.locator(SEL["fr_confirm"]).first.is_visible():
+                    break
+            except Exception:
+                break
+        wait(random.uniform(1.0, 2.5), self.stop)
+        if shots:
+            self.screenshot(f"after_{uid}")
+        # 5) проверка по перезагруженному списку: карточки человека больше нет
+        self.open_list()
+        ok = self.page.locator(f"{SEL['fr_item']}[data-id='{uid}']").count() == 0
+        if ok:
+            self.log(f"удалён из друзей: {name} ({uid}); друзей по счётчику {self.counter()}")
+        else:
+            self.log(f"удаление не подтвердилось: {name} ({uid}) всё ещё в списке")
+        if shots:
+            self.screenshot(f"reloaded_{uid}")
+        return ok
+
     def run(self) -> None:
-        self.finish("Режим удаления ещё не реализован (шаг Г)")
+        self.log(f"старт удаления: планка {self.cap}, окно {self.acc['work_start']}–{self.acc['work_end']}, "
+                 f"базовая пауза {self.base_pause:.1f} с, сегодня уже {self.today_done()}, "
+                 f"не трогать: {len(self.keep)} записей")
+        self.status(f"Удаляю друзей (планка {self.cap})")
+        self.resolve_urls()
+        self.open_list()
+        while True:
+            self.guard()
+            uid = self.pick()
+            if uid is None:
+                self.open_list()
+                uid = self.pick()
+                if uid is None:
+                    self.finish("Друзья кончились (или остались только из do_not_delete.txt)")
+            if random.random() < 1 / 15:
+                self.skipped.add(uid)
+                self.log(f"пропускаю {uid}")
+                continue
+            if self.want_distraction():
+                self.distract(uid)
+                self.open_list()
+                continue
+            self.attempts += 1
+            ok = self.delete_one(uid)
+            if ok:
+                self.handled.add(uid)
+                self.fails = 0
+                self.done_run += 1
+                store.add_done(self.name, "delete")
+                self.drv.refresh()
+                self.status(f"Удаляю друзей: сегодня {self.today_done()} из {self.cap}")
+                self.breaks()
+            else:
+                self.fails += 1
+                self.handled.add(uid)
+                if self.fails >= 3:
+                    self.incident("удаление не сработало трижды подряд")
+                self.open_list()
+            self.pause()
 
 
 def run(drv, page, mode: str, acc: dict) -> None:

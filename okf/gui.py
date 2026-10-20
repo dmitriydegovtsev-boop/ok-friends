@@ -2,6 +2,7 @@
 import os
 import queue
 import random
+import sys
 import threading
 import tkinter as tk
 import webbrowser
@@ -36,7 +37,7 @@ class App:
 
     def _autostart(self):
         """Служебный автозапуск для проверок: OKF_AUTO="Имя аккаунта:accept|delete|check"."""
-        auto = os.environ.get("OKF_AUTO", "")
+        auto = "" if getattr(sys, "frozen", False) else os.environ.get("OKF_AUTO", "")
         if ":" not in auto:
             return
         name, mode = auto.rsplit(":", 1)

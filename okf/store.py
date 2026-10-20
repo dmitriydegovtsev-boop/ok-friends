@@ -1,6 +1,7 @@
 """Настройки (settings.json), счётчики (counters/*.json), журналы (logs/*.txt), разгон."""
 import json
 import os
+import sys
 import threading
 from datetime import datetime, date, timedelta
 
@@ -28,7 +29,7 @@ DEFAULT_ACCOUNT = {
 # ---------- время (подменяется переменной OKF_FAKE_NOW для проверок) ----------
 
 def now() -> datetime:
-    fake = os.environ.get("OKF_FAKE_NOW")
+    fake = None if getattr(sys, "frozen", False) else os.environ.get("OKF_FAKE_NOW")
     if fake:
         try:
             return datetime.strptime(fake, "%Y-%m-%d %H:%M")
@@ -153,6 +154,13 @@ def load_counters(name: str) -> dict:
             except (OSError, ValueError):
                 pass
         return c
+
+
+def ensure_counters(name: str) -> None:
+    """Создать файл счётчиков при первом запуске аккаунта (фиксирует дату первого запуска)."""
+    with _lock:
+        if not _counter_path(name).exists():
+            save_counters(name, _default_counters())
 
 
 def save_counters(name: str, c: dict) -> None:

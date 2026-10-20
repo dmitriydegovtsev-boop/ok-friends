@@ -122,6 +122,7 @@ class AccountDriver(threading.Thread):
 
     def _execute(self, mode: str) -> None:
         acc = store.account_settings(self.account)
+        store.ensure_counters(self.account)   # дата первого запуска фиксируется при первом старте
         c = store.rollover(self.account, acc)
         today = store.today_str()
         if c.get("incident_day") == today:

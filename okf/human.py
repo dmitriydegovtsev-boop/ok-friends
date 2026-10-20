@@ -106,6 +106,14 @@ class Mouse:
         time.sleep(random.uniform(0.04, 0.13))
         self.page.mouse.up()
 
+    def click_box(self, box: dict) -> None:
+        """Клик по координатам элемента без прокрутки (для всплывающих меню, которые прячутся при уходе мыши)."""
+        self.move_to(*self.point_in(box))
+        time.sleep(random.uniform(0.06, 0.25))
+        self.page.mouse.down()
+        time.sleep(random.uniform(0.04, 0.13))
+        self.page.mouse.up()
+
     def scroll(self, total: int) -> None:
         """Прокрутка кусками по 150–450 px с паузами; total > 0 вниз, < 0 вверх."""
         left = abs(total)
