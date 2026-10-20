@@ -1,0 +1,68 @@
+name: build-windows-exe
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build OK-Friends.exe (one file, no console, with icon)
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name OK-Friends --icon assets/icon.ico
+          --collect-all playwright
+          ok_friends.py
+
+      - name: Check that the Playwright driver is inside the exe
+        shell: python
+        run: |
+          import subprocess, sys
+          out = subprocess.run(
+              [sys.executable, "-m", "PyInstaller.utils.cliutils.archive_viewer", "-l", "dist/OK-Friends.exe"],
+              capture_output=True, text=True).stdout
+          need = ["playwright/driver/node.exe", "playwright/driver/package/cli.js", "playwright/driver/package/lib/server"]
+          missing = [n for n in need if n not in out]
+          print("playwright/driver entries:", out.count("playwright/driver"))
+          if missing:
+              sys.exit("driver files missing from exe: " + ", ".join(missing))
+          print("driver ok")
+
+      - name: Smoke test (exe starts and exits without import errors)
+        shell: python
+        run: |
+          import subprocess, time, os
+          p = subprocess.Popen(["dist/OK-Friends.exe"])
+          time.sleep(20)
+          alive = p.poll() is None
+          if alive:
+              p.kill()
+              print("exe stayed alive 20 s (window opened) — ok")
+          else:
+              raise SystemExit(f"exe exited early with code {p.returncode}")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OK-Friends-windows
+          path: dist/OK-Friends.exe
+
+      - name: Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/OK-Friends.exe
+          body_path: README.txt

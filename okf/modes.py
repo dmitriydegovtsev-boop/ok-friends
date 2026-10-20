@@ -56,7 +56,7 @@ class Finished(Exception):
 
 def _test_env(name: str, default: str = "") -> str:
     """Служебные переменные OKF_* работают только при запуске из исходников, в .exe — никогда."""
-    if getattr(sys, "frozen", False):
+    if not paths.test_hooks_enabled():
         return default
     return os.environ.get(name, default)
 

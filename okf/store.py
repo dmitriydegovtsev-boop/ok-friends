@@ -29,7 +29,7 @@ DEFAULT_ACCOUNT = {
 # ---------- время (подменяется переменной OKF_FAKE_NOW для проверок) ----------
 
 def now() -> datetime:
-    fake = None if getattr(sys, "frozen", False) else os.environ.get("OKF_FAKE_NOW")
+    fake = os.environ.get("OKF_FAKE_NOW") if paths.test_hooks_enabled() else None
     if fake:
         try:
             return datetime.strptime(fake, "%Y-%m-%d %H:%M")

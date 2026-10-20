@@ -37,7 +37,7 @@ class App:
 
     def _autostart(self):
         """Служебный автозапуск для проверок: OKF_AUTO="Имя аккаунта:accept|delete|check"."""
-        auto = "" if getattr(sys, "frozen", False) else os.environ.get("OKF_AUTO", "")
+        auto = os.environ.get("OKF_AUTO", "") if paths.test_hooks_enabled() else ""
         if ":" not in auto:
             return
         name, mode = auto.rsplit(":", 1)

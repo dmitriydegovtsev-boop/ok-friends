@@ -9,6 +9,14 @@ def base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def test_hooks_enabled() -> bool:
+    """Служебные переменные OKF_* работают из исходников и в сборке с маркером DEV_BUILD (только мак-прогон).
+    В .exe для друга маркера нет, переменные не действуют."""
+    if not getattr(sys, "frozen", False):
+        return True
+    return (Path(getattr(sys, "_MEIPASS", "")) / "DEV_BUILD").exists()
+
+
 BASE = base_dir()
 PROFILES = BASE / "profiles"
 LOGS = BASE / "logs"
