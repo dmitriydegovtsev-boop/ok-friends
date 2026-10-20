@@ -43,6 +43,7 @@ LIMIT_TEXTS = re.compile(r"лимит|максимальн\w+ (число|кол
 
 MSG_HELP = "Нужна ваша помощь — смотрите окно браузера"
 MSG_CEILING = "Похоже, достигнут потолок друзей ОК. Можно приглашать в группу"
+MSG_UNCONFIRMED = "Действие не подтвердилось — остановлено, смотрите окно браузера"
 
 
 class Incident(Exception):
@@ -123,6 +124,13 @@ class Session:
             scale = 1.0
         wait(max(2.0, jitter(self.base_pause * factor * scale)), self.stop)
 
+    def body_text(self) -> str:
+        """Текст страницы с нормальными пробелами (ОК ставит неразрывные: «Пока нет\\xa0друзей»)."""
+        try:
+            return self.page.locator("body").inner_text(timeout=5000).replace("\xa0", " ")
+        except Exception:
+            return ""
+
     def screenshot(self, tag: str) -> str:
         stamp = store.now().strftime("%Y-%m-%d_%H-%M-%S")
         p = paths.SCREENSHOTS / f"{paths.safe_name(self.name)}_{stamp}_{tag}.png"
@@ -138,6 +146,12 @@ class Session:
         self.log(f"скриншот {shot}")
         self.status(MSG_HELP)
         raise Incident(text)
+
+    def unconfirmed_stop(self, what: str) -> None:
+        """Действие сделано, но результат не подтвердился: дальше не идём, аккаунт стоит."""
+        shot = self.screenshot("unconfirmed")
+        self.log(f"не подтверждено: {what}; скриншот {shot}")
+        self.finish(MSG_UNCONFIRMED)
 
     def finish(self, text: str) -> None:
         store.set_last_stop(self.name, text)
@@ -171,10 +185,9 @@ class Session:
         try:
             if self.page.locator("iframe[src*='captcha'], img[src*='captcha'], [id*='captcha' i]").count() > 0:
                 self.incident("капча")
-            body = self.page.locator("body").inner_text(timeout=3000)
         except Exception:
             return
-        m = INCIDENT_TEXTS.search(body)
+        m = INCIDENT_TEXTS.search(self.body_text())
         if m:
             self.incident("предупреждение ОК: «" + m.group(0) + "»")
 
@@ -274,7 +287,7 @@ class AcceptRun(Session):
         wait(random.uniform(1.5, 3.0), self.stop)
         self.check_page()
         if self.page.locator(SEL["req_block"]).count() == 0:
-            if SEL["req_empty_text"] in self.page.locator("body").inner_text(timeout=5000):
+            if SEL["req_empty_text"] in self.body_text():
                 self.finish("Заявки кончились")
             self.not_found += 1
             if self.not_found >= 2:
@@ -335,6 +348,7 @@ class AcceptRun(Session):
         # ждём до 10 с: карточка перерисовывается — ищем её заново по id;
         # успех = кнопки «Принять» нет и видна надпись «Заявка принята» (или карточка исчезла)
         ok = False
+        self.ok_error = False
         for _ in range(20):
             wait(0.5, self.stop)
             try:
@@ -345,6 +359,7 @@ class AcceptRun(Session):
                 it = it.first
                 if it.locator(SEL["req_error"]).first.is_visible():
                     self.log(f"ОК ответил ошибкой принятия для {name} ({uid})")
+                    self.ok_error = True
                     break
                 if it.locator(SEL["req_accept"]).count() == 0 and \
                         it.get_by_text(SEL["req_done_text"]).first.is_visible():
@@ -354,8 +369,7 @@ class AcceptRun(Session):
                 break
         if not ok:
             try:
-                body = self.page.locator("body").inner_text(timeout=3000)
-                m = LIMIT_TEXTS.search(body)
+                m = LIMIT_TEXTS.search(self.body_text())
                 if m:
                     self.log(f"ОК сообщает о лимите: «{m.group(0)}»")
                     self.screenshot("limit")
@@ -401,13 +415,17 @@ class AcceptRun(Session):
                 self.drv.refresh()
                 self.status(f"Принимаю заявки: сегодня {self.today_done()} из {self.cap}")
                 self.breaks()
-            else:
+            elif self.ok_error or self.fake_fail:
+                # ОК явно ответил ошибкой: это признак потолка друзей, трижды подряд — остановка
                 self.fails += 1
                 self.handled.add(uid)
+                self.log(f"«Принять» не сработало, ОК ответил ошибкой ({self.fails} подряд)")
                 if self.fails >= 3:
                     self.screenshot("ceiling")
                     self.finish(MSG_CEILING)
-                self.log(f"«Принять» не сработало ({self.fails} подряд)")
+            else:
+                # ни «Заявка принята», ни ошибки — результат неизвестен, дальше не идём
+                self.unconfirmed_stop(f"принятие заявки {uid}")
             self.pause()
 
 
@@ -424,7 +442,7 @@ class DeleteRun(Session):
         wait(random.uniform(1.5, 3.0), self.stop)
         self.check_page()
         if self.page.locator(SEL["fr_list"]).count() == 0:
-            if SEL["fr_empty_text"] in self.page.locator("body").inner_text(timeout=5000):
+            if SEL["fr_empty_text"] in self.body_text():
                 self.finish("Друзья кончились")
             self.not_found += 1
             if self.not_found >= 2:
@@ -530,13 +548,12 @@ class DeleteRun(Session):
         # 5) проверка по перезагруженному списку: карточки человека больше нет
         self.open_list()
         ok = self.page.locator(f"{SEL['fr_item']}[data-id='{uid}']").count() == 0
-        if ok:
-            self.log(f"удалён из друзей: {name} ({uid}); друзей по счётчику {self.counter()}")
-        else:
-            self.log(f"удаление не подтвердилось: {name} ({uid}) всё ещё в списке")
         if shots:
             self.screenshot(f"reloaded_{uid}")
-        return ok
+        if ok:
+            self.log(f"удалён из друзей: {name} ({uid}); друзей по счётчику {self.counter()}")
+            return True
+        self.unconfirmed_stop(f"удаление {name} ({uid}) — человек всё ещё в списке")
 
     def run(self) -> None:
         self.log(f"старт удаления: планка {self.cap}, окно {self.acc['work_start']}–{self.acc['work_end']}, "
@@ -572,10 +589,8 @@ class DeleteRun(Session):
                 self.status(f"Удаляю друзей: сегодня {self.today_done()} из {self.cap}")
                 self.breaks()
             else:
-                self.fails += 1
+                # сюда попадаем только если меню/окно не нашлись (действия не было); второй промах — инцидент
                 self.handled.add(uid)
-                if self.fails >= 3:
-                    self.incident("удаление не сработало трижды подряд")
                 self.open_list()
             self.pause()
 
