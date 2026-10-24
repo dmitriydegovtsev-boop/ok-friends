@@ -1,9 +1,13 @@
 """Пути программы: всё лежит рядом с .exe (или рядом с папкой okf при запуске из исходников)."""
+import os
 import sys
 from pathlib import Path
 
 
 def base_dir() -> Path:
+    # OKF_BASE — служебная папка для проверок (только из исходников или в DEV_BUILD)
+    if test_hooks_enabled() and os.environ.get("OKF_BASE"):
+        return Path(os.environ["OKF_BASE"]).resolve()
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent

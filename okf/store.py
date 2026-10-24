@@ -1,28 +1,18 @@
-"""Настройки (settings.json), счётчики (counters/*.json), журналы (logs/*.txt), разгон."""
+"""Настройки (settings.json), счётчики (counters/*.json), журналы (logs/*.txt), отметка инцидента."""
 import json
 import os
-import sys
 import threading
-from datetime import datetime, date, timedelta
+from datetime import datetime
 
 from . import paths
 
 _lock = threading.RLock()
 
-SLIDER_MIN = 250
-SLIDER_MAX = 6000
-SLIDER_STEP = 50
-RAMP_START = 250
-RAMP_FLOOR = 100
-HIGH_PACE = 500
+RUN_LIMIT_MAX = 6000
+SCHEMA = 2          # v0.2.0: отметки инцидентов прошлых версий при первом чтении снимаются
 
 DEFAULT_ACCOUNT = {
-    "accept_limit": 250,
-    "delete_limit": 250,
-    "ramp": True,
-    "work_start": "9:00",
-    "work_end": "23:00",
-    "warned_high": False,
+    "run_limit": RUN_LIMIT_MAX,
 }
 
 
@@ -93,34 +83,6 @@ def account_names() -> list:
     return list(load_settings()["accounts"].keys())
 
 
-# ---------- рабочее окно ----------
-
-def parse_hm(s: str) -> int:
-    h, m = s.split(":")
-    return int(h) * 60 + int(m)
-
-
-def window_minutes(acc: dict) -> int:
-    """Длина рабочего окна в минутах."""
-    start = parse_hm(acc["work_start"])
-    end = parse_hm(acc["work_end"])
-    if end <= start:
-        end += 24 * 60
-    return end - start
-
-
-def in_work_window(acc: dict, moment: datetime | None = None) -> bool:
-    moment = moment or now()
-    start = parse_hm(acc["work_start"])
-    end = parse_hm(acc["work_end"])
-    if end <= start:
-        end += 24 * 60
-    cur = moment.hour * 60 + moment.minute
-    if cur < start:
-        cur += 24 * 60
-    return start <= cur < end
-
-
 # ---------- counters/<аккаунт>.json ----------
 
 def _counter_path(name: str):
@@ -136,11 +98,11 @@ def _default_counters() -> dict:
         "delete_today": 0,
         "accept_total": 0,
         "delete_total": 0,
-        "ramp_cap": RAMP_START,
-        "ramp_reason": "старт: планка 250",
         "incident_day": None,
         "incident_text": "",
         "last_stop": "",
+        "last_mode": "accept",
+        "schema": SCHEMA,
     }
 
 
@@ -150,9 +112,19 @@ def load_counters(name: str) -> dict:
         c = _default_counters()
         if p.exists():
             try:
-                c.update(json.loads(p.read_text(encoding="utf-8")))
+                raw = json.loads(p.read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                pass
+                raw = {}
+            c.update(raw)
+            if int(raw.get("schema", 1)) < SCHEMA:
+                # счётчики прошлой версии: остаются как есть, только отметка инцидента не учитывается
+                old = raw.get("incident_day")
+                c["incident_day"] = None
+                c["incident_text"] = ""
+                c["schema"] = SCHEMA
+                save_counters(name, c)
+                if old:
+                    append_log(name, "система", f"v0.2.0: отметка инцидента прошлой версии ({old}) снята")
         return c
 
 
@@ -171,60 +143,54 @@ def save_counters(name: str, c: dict) -> None:
         tmp.replace(p)
 
 
-def round10(x: float) -> int:
-    return int(round(x / 10.0)) * 10
-
-
-def rollover(name: str, acc: dict | None = None) -> dict:
-    """Смена дня: сброс дневных счётчиков и пересчёт планки разгона. Возвращает счётчики."""
-    acc = acc or account_settings(name)
+def rollover(name: str) -> dict:
+    """Смена дня: сброс счётчиков «сегодня». Возвращает счётчики."""
     with _lock:
         c = load_counters(name)
         today = today_str()
         if c["day"] != today:
-            prev = c["day"]
-            slider_max = max(int(acc["accept_limit"]), int(acc["delete_limit"]))
-            worked = c["accept_today"] + c["delete_today"] > 0
-            if c.get("incident_day") == prev:
-                c["ramp_reason"] = f"{prev}: был инцидент, планка {c['ramp_cap']} сохранена на новый день"
-            elif worked:
-                new_cap = min(round10(c["ramp_cap"] * 1.5), slider_max)
-                if new_cap > c["ramp_cap"]:
-                    c["ramp_reason"] = f"{prev}: спокойный день, планка {c['ramp_cap']} → {new_cap}"
-                else:
-                    c["ramp_reason"] = f"{prev}: спокойный день, планка {c['ramp_cap']} уже на бегунке"
-                c["ramp_cap"] = new_cap
-            else:
-                c["ramp_reason"] = f"{prev}: аккаунт не работал, планка {c['ramp_cap']} без изменений"
             c["day"] = today
             c["accept_today"] = 0
             c["delete_today"] = 0
             save_counters(name, c)
-            append_log(name, "система", f"новый день, планка {c['ramp_cap']} ({c['ramp_reason']})")
+            append_log(name, "система", "новый день")
         return c
-
-
-def effective_cap(name: str, mode: str, acc: dict | None = None) -> int:
-    """Дневная планка для режима: разгон (если включён) не выше бегунка; без разгона — бегунок."""
-    acc = acc or account_settings(name)
-    slider = int(acc["accept_limit"] if mode == "accept" else acc["delete_limit"])
-    if not acc.get("ramp", True):
-        return slider
-    c = rollover(name, acc)
-    return min(int(c["ramp_cap"]), slider)
 
 
 def record_incident(name: str, text: str) -> dict:
+    """Отметка инцидента: аккаунт не запускается, пока не нажата «Сбросить и продолжить»."""
     with _lock:
         c = rollover(name)
-        new_cap = max(RAMP_FLOOR, round10(c["ramp_cap"] / 2))
-        c["ramp_reason"] = f"{today_str()}: инцидент ({text}), планка {c['ramp_cap']} → {new_cap}"
-        c["ramp_cap"] = new_cap
         c["incident_day"] = today_str()
         c["incident_text"] = text
         save_counters(name, c)
-        append_log(name, "инцидент", f"{text}; планка → {new_cap}; аккаунт стоит до конца дня")
+        append_log(name, "инцидент", f"{text}; аккаунт стоит до кнопки «Сбросить и продолжить»")
         return c
+
+
+def clear_incident(name: str) -> None:
+    with _lock:
+        c = load_counters(name)
+        if c.get("incident_day"):
+            append_log(name, "система", f"отметка инцидента снята кнопкой ({c.get('incident_text', '')})")
+        c["incident_day"] = None
+        c["incident_text"] = ""
+        save_counters(name, c)
+
+
+def set_last_mode(name: str, mode: str) -> None:
+    with _lock:
+        c = load_counters(name)
+        c["last_mode"] = mode
+        save_counters(name, c)
+
+
+def run_limit(acc: dict) -> int:
+    try:
+        n = int(acc.get("run_limit", RUN_LIMIT_MAX))
+    except (TypeError, ValueError):
+        n = RUN_LIMIT_MAX
+    return max(1, min(RUN_LIMIT_MAX, n))
 
 
 def add_done(name: str, mode: str, n: int = 1) -> dict:
@@ -245,7 +211,7 @@ def set_last_stop(name: str, text: str) -> None:
 
 # ---------- logs/<аккаунт>.txt ----------
 
-MODE_RU = {"accept": "приём", "delete": "удаление", "система": "система", "инцидент": "инцидент"}
+MODE_RU = {"accept": "приём", "delete": "удаление", "reset": "сброс", "check": "вход", "система": "система", "инцидент": "инцидент"}
 
 
 def append_log(name: str, mode: str, text: str) -> str:

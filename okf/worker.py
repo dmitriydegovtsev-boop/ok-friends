@@ -6,12 +6,11 @@ import traceback
 from playwright.sync_api import sync_playwright
 
 from . import browser, store, paths
-from .human import Stopped
+from .stop import Stopped
 
 MSG_LOGIN = "Войдите в ОК в окне браузера и нажмите кнопку ещё раз"
 MSG_CLOSED = "Окно браузера закрыто. Нажмите кнопку ещё раз, чтобы открыть заново"
-MSG_HELP = "Нужна ваша помощь — смотрите окно браузера"
-MSG_CEILING = "Похоже, достигнут потолок друзей ОК. Можно приглашать в группу"
+MSG_INCIDENT = "Был инцидент ({}). Посмотрите окно Chrome, затем нажмите «Сбросить и продолжить»"
 
 
 class AccountDriver(threading.Thread):
@@ -69,6 +68,8 @@ class AccountDriver(threading.Thread):
                 except browser.NoChrome:
                     self.app.post(self.account, "no_chrome", None)
                     self.status("Установите Google Chrome")
+                except browser.CertWarning as e:
+                    self.cert_stop(cmd, e.code)
                 except Exception as e:
                     if browser.is_closed_error(e):
                         # окно закрыли руками: закрываем остатки Chrome, иначе он без окон держит профиль
@@ -82,6 +83,23 @@ class AccountDriver(threading.Thread):
                 finally:
                     self.busy = False
                     self.refresh()
+
+    def screenshot(self, tag: str) -> str:
+        stamp = store.now().strftime("%Y-%m-%d_%H-%M-%S")
+        p = paths.SCREENSHOTS / f"{paths.safe_name(self.account)}_{stamp}_{tag}.png"
+        try:
+            if self.ctx is not None and self.ctx.pages:
+                self.ctx.pages[0].screenshot(path=str(p))
+        except Exception:
+            pass
+        return p.name
+
+    def cert_stop(self, mode: str, code: str) -> None:
+        """Предупреждение Chrome о сертификате: не обходим, останавливаемся со скриншотом."""
+        shot = self.screenshot("cert")
+        store.set_last_stop(self.account, browser.MSG_CERT)
+        self.log(mode, f"остановка: предупреждение Chrome о сертификате, код {code or 'не виден'}; скриншот {shot}")
+        self.status(browser.MSG_CERT)
 
     def _close_ctx(self) -> None:
         ctx, self.ctx = self.ctx, None
@@ -124,17 +142,19 @@ class AccountDriver(threading.Thread):
 
     def _execute(self, mode: str) -> None:
         acc = store.account_settings(self.account)
-        store.ensure_counters(self.account)   # дата первого запуска фиксируется при первом старте
-        c = store.rollover(self.account, acc)
-        today = store.today_str()
-        if c.get("incident_day") == today:
-            self.status("Сегодня был инцидент — аккаунт стоит до конца дня")
-            self.log(mode, "запуск отклонён: сегодня был инцидент")
+        store.ensure_counters(self.account)
+        if mode == "reset":
+            # «Сбросить и продолжить»: снять отметку инцидента и сразу запустить режим, который шёл
+            store.clear_incident(self.account)
+            mode = store.load_counters(self.account).get("last_mode") or "accept"
+            self.log(mode, "«Сбросить и продолжить»: продолжаю " + ("приём" if mode == "accept" else "удаление"))
+        c = store.rollover(self.account)
+        if mode != "check" and c.get("incident_day"):
+            self.status(MSG_INCIDENT.format(c.get("incident_text") or c["incident_day"]))
+            self.log(mode, "запуск отклонён: отметка инцидента, нужна кнопка «Сбросить и продолжить»")
             return
-        if not store.in_work_window(acc):
-            self.status(f"Вне рабочего окна {acc['work_start']}–{acc['work_end']}")
-            self.log(mode, "запуск отклонён: вне рабочего окна")
-            return
+        if mode in ("accept", "delete"):
+            store.set_last_mode(self.account, mode)
         page = self._ensure_page()
         self.status("Проверяю вход в ОК…")
         if not browser.is_logged_in(page):
