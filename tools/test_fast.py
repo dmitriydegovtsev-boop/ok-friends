@@ -306,6 +306,8 @@ def scenario_real(d: Driver):
 
 def scenario_realdel(d: Driver):
     n = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+    if len(sys.argv) > 3 and sys.argv[3] == "all":
+        return scenario_realdel_all(d)
     before = counters()["delete_total"]
     store.update_account(ACC, run_limit=n)
     try:
@@ -318,6 +320,18 @@ def scenario_realdel(d: Driver):
         check("в журнале нет «не подтверждено»", not any("не подтверждено" in l for l in lt), "\n    ".join(lt))
     finally:
         store.update_account(ACC, run_limit=6000)
+
+
+def scenario_realdel_all(d: Driver):
+    before = counters()["delete_total"]
+    store.update_account(ACC, run_limit=6000)
+    d.press("btn_delete")
+    s = d.wait_status(lambda s: s.startswith("Друзья кончились") or "подряд" in s or s.startswith("Ошибка")
+                      or s.startswith("Список пройден") or "Не нашёл" in s, 300)
+    check("живое удаление всех: «Друзья кончились»", s.startswith("Друзья кончились"), s)
+    print("  удалено за запуск:", counters()["delete_total"] - before)
+    lt = [l for l in log_text().splitlines() if "[удаление]" in l and "шаг:" not in l][-14:]
+    check("в журнале нет «не подтверждено»", not any("не подтверждено" in l for l in lt), "\n    ".join(lt))
 
 
 def gui_msg_login():

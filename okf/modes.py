@@ -1,5 +1,6 @@
 """Режимы «Принять заявки» и «Удалить друзей» (быстрый режим, v0.2.0): клики подряд по видимым
 карточкам, пауза 0,7–1,5 с, после порции — перезагрузка списка."""
+import os
 import random
 import re
 import time
@@ -157,6 +158,11 @@ class Session:
             pass
         return p.name
 
+    def shot(self, tag: str) -> None:
+        """Служебные скриншоты каждого шага (OKF_SHOTS=1, только из исходников или DEV_BUILD)."""
+        if paths.test_hooks_enabled() and os.environ.get("OKF_SHOTS") == "1":
+            self.log("шаг: скриншот " + self.screenshot(tag))
+
     def pause(self) -> None:
         wait(random.uniform(*PAUSE), self.stop)
 
@@ -230,7 +236,8 @@ class Session:
 
     def hide_banners(self) -> None:
         """Рекламная плашка ОК внизу слева (#hook_Block_FixedPromoBanner, z-index 4000) перекрывает карточки
-        и пункт меню друга, «Скрыть» её не убирает. Прячем у себя на странице, на сервер ничего не уходит."""
+        и пункт меню друга, «Скрыть» её не убирает. Прячем у себя на странице, на сервер ничего не уходит.
+        Зовётся перед каждым действием: после окна «удалён из списка» ОК перерисовывает страницу и плашку."""
         try:
             self.page.evaluate("() => document.querySelectorAll(\"#hook_Block_FixedPromoBanner, [class*='fixed_promo'],"
                                " [class*='fixed-promo']\").forEach(e => e.style.setProperty('display', 'none', 'important'))")
@@ -357,6 +364,7 @@ class AcceptRun(Session):
         return out
 
     def accept_one(self, uid: str) -> None:
+        self.hide_banners()
         card = self.page.locator(f"{SEL['req_item']}[data-entity-id='{uid}']").first
         name = ""
         try:
@@ -486,6 +494,7 @@ class DeleteRun(Session):
         return out
 
     def delete_one(self, uid: str) -> None:
+        self.hide_banners()
         card = self.page.locator(f"{SEL['fr_item']}[data-id='{uid}']").first
         name = ""
         try:
@@ -524,6 +533,7 @@ class DeleteRun(Session):
                     raise
         if not shown:
             return self.not_confirmed(uid, f"меню «Прекратить дружбу» не появилось для {who}")
+        self.shot(f"menu_{uid}")
         # 2) пункт меню — клик по координатам (меню прячется, если мышь уходит в сторону)
         box = item.bounding_box()
         if not box:
@@ -534,6 +544,8 @@ class DeleteRun(Session):
         # 3) окно подтверждения именно для этого человека → «Прекратить»
         try:
             self.page.locator(f"{SEL['fr_modal_uid']}[value='{uid}']").wait_for(state="attached", timeout=5000)
+            self.page.locator(SEL["fr_confirm"]).first.wait_for(state="visible", timeout=5000)
+            self.shot(f"confirm_{uid}")
             self.page.locator(SEL["fr_confirm"]).first.click(timeout=5000)
         except Exception as e:
             if browser.is_closed_error(e):
@@ -551,7 +563,9 @@ class DeleteRun(Session):
                     done = SEL["fr_done_text"] in norm(self.dialog_text())
                     self.log(f"удалён из друзей: {who}{'' if done else ' (окно закрылось без надписи)'}; "
                              f"друзей по счётчику {self.counter()}")
+                    self.shot(f"result_{uid}")
                     self.close_result()
+                    self.shot(f"closed_{uid}")
                     return
             except Stopped:
                 raise
