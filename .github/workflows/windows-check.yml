@@ -28,7 +28,7 @@ jobs:
         run: |
           rc=0
           python tools/win_check.py 2>&1 | tee win_check.txt || rc=$?
-          grep -E "^[0-9]\)|итог|ИТОГО|журнал программы" win_check.txt | head -9 | while read -r l; do echo "::notice title=win_check::$l"; done
+          { grep -E "^[0-9]\)|итог|ИТОГО|журнал программы" win_check.txt | head -9 || true; } | while read -r l; do echo "::notice title=win_check::$l"; done
           exit $rc
 
       - name: Dry run on the OK mock (all scenarios)
@@ -40,7 +40,7 @@ jobs:
         run: |
           rc=0
           python tools/test_fast.py mock 2>&1 | tee test_fast.txt || rc=$?
-          { grep -E "ИТОГО" test_fast.txt; grep -E "^\s*FAIL" test_fast.txt | head -8; } | while read -r l; do echo "::notice title=test_fast::$l"; done
+          { grep -E "ИТОГО" test_fast.txt || true; grep -E "^\s*FAIL" test_fast.txt | head -8 || true; } | while read -r l; do echo "::notice title=test_fast::$l"; done
           exit $rc
 
       - uses: actions/upload-artifact@v4
