@@ -1,4 +1,4 @@
-"""Режимы «Принять заявки» и «Удалить друзей» (быстрый режим, v0.2.0–v0.2.1): клики подряд по видимым
+"""Режимы «Принять заявки» и «Удалить друзей» (быстрый режим, v0.2.0–v0.2.2): клики подряд по видимым
 карточкам, пауза 0,7–1,5 с, после порции — перезагрузка списка."""
 import os
 import random
@@ -24,11 +24,11 @@ SEL = {
     "fr_item": "[data-block='MyFriendsSquareCardsPagingB'] .user-grid-card[data-id]",
     "fr_avatar": ".user-grid-card_img",
     "fr_name": ".user-grid-card_name a",
-    # меню друга — один общий блок на странице (#block_ShortcutMenu_FriendControlMenu_…), первая строка — имя;
-    # если внизу мало места, открывается вверх (sc-menu__top)
+    # меню друга (ok.ru 27.10.2026): общий #hook_Block_ShortcutMenu в body, на каждое наведение — новый
+    # div.sc-menu#block_ShortcutMenu_…_<число>, имя в .sc-menu_user_n; прежние получают sc-menu__hidden.
+    # Пункт ищется по тексту или aria-label без учёта пробелов: у ОК бывает aria-label « Написать сообщение»
     "fr_menu": ".sc-menu:not(.sc-menu__hidden)",
-    "fr_menu_remove": ".sc-menu:not(.sc-menu__hidden) a.u-menu_a[aria-label='Прекратить дружбу']",
-    "fr_menu_item": "a.u-menu_a[aria-label='Прекратить дружбу']",
+    "fr_remove_text": "Прекратить дружбу",
     "fr_modal": "#hook_Modal_popLayerModal",
     "fr_modal_uid": "#hook_Modal_popLayerModal #field_userIds",
     "fr_confirm": "#hook_Modal_popLayerModal #hook_FormButton_button_delete_confirm",
@@ -128,7 +128,7 @@ JS_AIM = """([sel, shift]) => {
   let r = el.getBoundingClientRect();
   const H = innerHeight;
   if (shift) window.scrollBy(0, shift);
-  else if (r.top < H * 0.25 || r.bottom > H * 0.75) el.scrollIntoView({block: 'center', inline: 'nearest'});
+  else if (r.top < H * 0.25 || r.bottom > H * 0.75) el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
   r = el.getBoundingClientRect();
   const pts = [[.5, .5], [.5, .7], [.5, .3], [.3, .5], [.7, .5], [.5, .85], [.5, .15], [.25, .8], [.75, .8]];
   for (const [fx, fy] of pts) {
@@ -149,6 +149,47 @@ JS_OVER = """([x, y, sel]) => {
   if (t && el && (t === el || el.contains(t))) return 'сама цель (' + okfDescribe(t) + ')';
   return okfDescribe(t);
 }"""
+
+# Меню человека после наведения: видимое .sc-menu, чьё имя (.sc-menu_user_n или первая строка) совпадает с одним из
+# имён карточки (подпись, aria-label аватара); если не совпало — единственное меню, всплывшее после наведения (id нет
+# в списке before; ОК на каждое наведение создаёт новый блок). Окно подтверждения потом всё равно сверяется по id человека.
+# Пункт — a/button/menuitem, у которого текст или aria-label без учёта пробелов и регистра = want; помечается
+# data-okf-item, возвращается его середина и что лежит в этой точке.
+JS_MENU = """([names, want, before]) => {
+  """ + JS_DESCRIBE + """
+  const n = s => (s || '').replace(/[\\s\\u00a0]+/g, ' ').trim().toLowerCase().replace(/ё/g, 'е');
+  const vis = e => { const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+    return r.width > 2 && r.height > 2 && st.display !== 'none' && st.visibility !== 'hidden' && +st.opacity > 0.05 &&
+           r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight; };
+  const who = m => { const u = m.querySelector('.sc-menu_user_n'); return n(u ? u.textContent : (m.innerText || '').split('\\n')[0]); };
+  const lines = m => [...m.querySelectorAll('.u-menu_a, [role=menuitem], li')].filter(vis)
+    .map(e => (e.innerText || e.textContent || '').replace(/\\s+/g, ' ').trim()).filter((t, i, a) => t && a.indexOf(t) === i);
+  const same = (a, b) => a === b || (a.endsWith('…') && b.startsWith(a.slice(0, -1).trim())) || (b.endsWith('…') && a.startsWith(b.slice(0, -1).trim()));
+  const wanted = names.map(n).filter(Boolean);
+  const menus = [...document.querySelectorAll('.sc-menu:not(.sc-menu__hidden)')].filter(m => !m.classList.contains('compact-footer_menu') && vis(m));
+  if (!menus.length) return {menu: false};
+  let m = menus.find(x => wanted.some(w => same(who(x), w))), how = 'по имени';
+  if (!m) {
+    const fresh = menus.filter(x => !before.includes(x.id));
+    if (fresh.length === 1) { m = fresh[0]; how = wanted.length ? 'новое после наведения, имя «' + who(m) + '» не совпало' : 'новое после наведения'; }
+  }
+  if (!m) return {menu: true, mine: false, other: menus.map(x => '«' + who(x) + '»: ' + lines(x).slice(0, 4).join(' / ')).join('; ')};
+  const w = n(want);
+  const item = [...m.querySelectorAll('a, button, [role=menuitem], [role=button]')].filter(vis)
+    .find(e => n(e.getAttribute('aria-label')) === w || n(e.innerText || e.textContent) === w);
+  const top = item && (item.closest('a, button, [role=menuitem]') || item);
+  const res = {menu: true, mine: true, how, who: who(m), lines: lines(m)};
+  if (!top) return res;
+  document.querySelectorAll('[data-okf-item]').forEach(e => e.removeAttribute('data-okf-item'));
+  top.setAttribute('data-okf-item', '1');
+  const r = top.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2, t = document.elementFromPoint(x, y);
+  return Object.assign(res, {item: true, x, y, free: !!t && (t === top || top.contains(t)), over: okfDescribe(t)});
+}"""
+# id всех меню на странице — до наведения
+JS_MENU_IDS = "() => [...document.querySelectorAll('.sc-menu')].map(m => m.id).filter(Boolean)"
+# имена человека на карточке: подпись и aria-label аватара
+JS_CARD_NAMES = """(card) => [(card.querySelector('.user-grid-card_name a') || {}).innerText,
+  (card.querySelector('.user-grid-card_img') || {getAttribute: () => ''}).getAttribute('aria-label')].filter(Boolean)"""
 
 # видимые окна поверх страницы: текст каждого
 JS_DIALOGS = """() => {
@@ -495,10 +536,15 @@ class Session:
         elif self.since_reload >= self.reload_every:
             self.reload_now = self.reload_now or "profilactic"
 
-    def not_confirmed(self, uid: str, what: str, over: str | None = None) -> None:
-        """Не подтвердилось: в журнал (и что лежит поверх точки), человека пропускаем, идём дальше;
-        3 подряд — закрыть окна и перезагрузить страницу (recover)."""
+    def not_confirmed(self, uid: str, what: str, over: str | None = None, menu: str | None = None) -> None:
+        """Не подтвердилось: в журнал (адрес страницы, что было с меню, что лежит поверх точки), человека
+        пропускаем, идём дальше; 3 подряд — закрыть окна и перезагрузить страницу (recover)."""
         over = over or self.over()
+        try:
+            where = self.page.url
+        except Exception:
+            where = "?"
+        what = f"{what}; страница {where}" + (f"; меню: {menu}" if menu else "")
         self.skipped.add(uid)
         self.fails[uid] = self.fails.get(uid, 0) + 1
         self.streak.append(uid)
@@ -595,7 +641,10 @@ class Session:
             self.urls["friends"] = browser.OK + fr.get_attribute("href", timeout=8000)
         except Exception:
             self.unknown_page("ссылки на заявки и друзей на странице друзей")
-        self.log(f"страница заявок {self.urls['requests']}")
+        if self.mode == "delete":
+            self.log(f"страница друзей {self.urls['friends']}")
+        else:
+            self.log(f"страница заявок {self.urls['requests']}")
 
     def load_more(self, item_sel: str) -> bool:
         """Все загруженные карточки пройдены или пропущены — прокрутить вниз, вдруг ОК догрузит ещё."""
@@ -779,6 +828,7 @@ class DeleteRun(Session):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.keep = store.read_do_not_delete()
+        self.not_friends = set()            # в меню нет «Прекратить дружбу» — до конца запуска не трогаем
 
     def open_list(self) -> bool:
         """Открыть (перезагрузить) список друзей. False — друзей нет."""
@@ -829,77 +879,97 @@ class DeleteRun(Session):
             out.append(uid)
         return out
 
-    def delete_one(self, uid: str) -> None:
-        self.prep()
-        card = self.page.locator(f"{SEL['fr_item']}[data-id='{uid}']").first
-        name = ""
+    def menu_state(self, names: list, before: list) -> dict:
         try:
-            name = norm(card.locator(SEL["fr_name"]).first.inner_text(timeout=1000))
-        except Exception:
-            pass
-        who = f"{name} ({uid})"
-        # 1) навести на аватар — всплывает меню; не всплыло — отвести мышь и навести ещё раз.
-        #    Меню ищем по имени человека: иначе можно взять ещё не спрятанное меню предыдущего друга
-        avatar_sel = f"{SEL['fr_item']}[data-id='{uid}'] {SEL['fr_avatar']}"
-        if name:
-            # textContent меню: имя может слипаться со следующей строкой; «Друг 1» ≠ «Друг 10»
-            head = re.compile(r"^\s*" + r"\s+".join(map(re.escape, name.split())) + r"(?![0-9a-zа-яё])")
-            item = self.page.locator(SEL["fr_menu"]).filter(has_text=head).locator(SEL["fr_menu_item"]).first
-        else:
-            item = self.page.locator(SEL["fr_menu_remove"]).first
-        shown = False
-        blocked = None
-        for attempt in range(2):
-            try:
-                if attempt:
-                    self.page.mouse.move(5, 5)
-                    wait(0.3, self.stop)
-                    self.prep()
-                # карточку в середину окна, точка на аватаре, которую ничто не перекрывает; мышью туда, а не
-                # avatar.hover(): всплывшее меню перекрывает аватар, и hover() ждал бы, пока под мышью снова аватар
-                aim = self.aim(avatar_sel)
-                if aim.get("err"):
-                    raise LookupError(aim["err"])
-                if aim.get("blocked"):
-                    blocked = aim["blocked"]
-                    continue
-                self.page.mouse.move(aim["x"], aim["y"], steps=4)
-                item.wait_for(state="visible", timeout=3000)
-                shown = True
-                break
-            except Stopped:
+            return self.page.evaluate(JS_MENU, [names, SEL["fr_remove_text"], before])
+        except Exception as e:
+            if browser.is_closed_error(e):
                 raise
+            return {"menu": False, "err": " ".join(str(e).split())[:100]}
+
+    @staticmethod
+    def menu_text(st: dict) -> str:
+        """Что было с меню — для журнала."""
+        if not st or not st.get("menu"):
+            return "не всплыло"
+        if not st.get("mine"):
+            return "всплыло чужое — " + (st.get("other") or "")[:200]
+        return f"видно ({st.get('how')}): " + " / ".join(st.get("lines") or [])[:200]
+
+    def delete_one(self, uid: str) -> None:
+        """Порядок (v0.2.2): мышь в сторону → всплывашки и плашка (prep) → карточку в середину окна (aim) →
+        ТОЛЬКО ПОТОМ навести мышь → дождаться меню → «Прекратить дружбу» → «Прекратить» → закрыть окно
+        «удалён из списка». Между наведением и кликом по пункту — никаких Escape, прокруток и скрытий."""
+        card = self.page.locator(f"{SEL['fr_item']}[data-id='{uid}']").first
+        names = []
+        try:
+            names = [norm(x) for x in card.evaluate(JS_CARD_NAMES) if norm(x)]
+        except Exception as e:
+            if browser.is_closed_error(e):
+                raise
+        name = names[0] if names else ""
+        who = f"{name} ({uid})"
+        avatar_sel = f"{SEL['fr_item']}[data-id='{uid}'] {SEL['fr_avatar']}"
+        st, blocked = {}, None
+        for attempt in range(2):
+            # 1) до наведения: мышь в сторону (меню прошлого друга прячется), всплывашки, прицел
+            self.page.mouse.move(5, 5)
+            wait(0.3 if attempt else 0.1, self.stop)
+            self.prep()
+            aim = self.aim(avatar_sel)
+            if aim.get("err"):
+                st = {"menu": False}
+                blocked = aim["err"]
+                continue
+            if aim.get("blocked"):
+                blocked = aim["blocked"]
+                continue
+            try:
+                before = self.page.evaluate(JS_MENU_IDS)
             except Exception as e:
                 if browser.is_closed_error(e):
                     raise
-        if not shown:
-            return self.not_confirmed(uid, f"меню «Прекратить дружбу» не появилось для {who}", over=blocked)
+                before = []
+            wait(0.15, self.stop)
+            # 2) навести — с этого места до клика по пункту ничего не закрываем и не прокручиваем
+            self.page.mouse.move(aim["x"], aim["y"], steps=4)
+            end = time.monotonic() + 3.0
+            mine_since = None
+            while True:
+                st = self.menu_state(names, before)
+                if st.get("mine"):
+                    if st.get("item"):
+                        break
+                    # меню этого человека видно, а «Прекратить дружбу» нет — даём ему 0,6 с дорисоваться
+                    mine_since = mine_since or time.monotonic()
+                    if time.monotonic() - mine_since >= 0.6:
+                        break
+                if time.monotonic() >= end:
+                    break
+                wait(0.15, self.stop)
+            if st.get("mine"):
+                break
+        if not st.get("mine"):
+            what = "меню человека не всплыло" if not st.get("menu") else "всплыло меню другого человека"
+            return self.not_confirmed(uid, f"{what} для {who}", over=blocked, menu=self.menu_text(st))
+        if not st.get("item"):
+            # не друг (исходящая заявка, подписка…): не трогаем, до конца запуска к нему не возвращаемся
+            self.not_friends.add(uid)
+            self.skipped.add(uid)
+            self.log(f"пропуск: не друг (в меню: {' / '.join((st.get('lines') or [])[:6])[:200]}) — {who}")
+            self.page.mouse.move(5, 5)
+            return
         self.shot(f"menu_{uid}")
-        # 2) пункт меню — клик по координатам (меню прячется, если мышь уходит в сторону); точку проверяем:
-        #    поверх пункта не должно лежать ничего чужого
-        try:
-            box = item.bounding_box(timeout=2000)
-        except Exception as e:
-            if browser.is_closed_error(e):
-                raise
-            box = None      # меню успело спрятаться
-        if not box:
-            return self.not_confirmed(uid, f"пункт «Прекратить дружбу» без координат для {who}")
-        px, py = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        menu = self.menu_text(st)
+        # 3) пункт меню — клик по координатам (меню прячется, если мышь уходит в сторону)
+        px, py = st["x"], st["y"]
         self.last_point, self.last_target = (px, py), None
-        try:
-            free = item.evaluate("(e, [x, y]) => { const t = document.elementFromPoint(x, y); return !!t && (t === e || e.contains(t)); }",
-                                 [px, py])
-        except Exception as e:
-            if browser.is_closed_error(e):
-                raise
-            free = True
-        if not free:
-            return self.not_confirmed(uid, f"пункт «Прекратить дружбу» перекрыт для {who}")
+        if not st.get("free"):
+            return self.not_confirmed(uid, f"пункт «Прекратить дружбу» перекрыт для {who}", over=st.get("over"), menu=menu)
         self.page.mouse.move(px, py, steps=4)
         self.page.mouse.down()
         self.page.mouse.up()
-        # 3) окно подтверждения именно для этого человека → «Прекратить»
+        # 4) окно подтверждения именно для этого человека → «Прекратить»
         try:
             self.page.locator(f"{SEL['fr_modal_uid']}[value='{uid}']").wait_for(state="attached", timeout=5000)
             self.page.locator(SEL["fr_confirm"]).first.wait_for(state="visible", timeout=5000)
@@ -910,9 +980,9 @@ class DeleteRun(Session):
                 raise
             over = self.over()
             self.close_dialogs()
-            return self.not_confirmed(uid, f"окно подтверждения не появилось или «Прекратить» не нажалось для {who}",
-                                      over=over)
-        # 4) успех — окно подтверждения закрылось; ОК на его месте показывает «Этот человек удалён из
+            return self.not_confirmed(uid, f"меню было, пункт «Прекратить дружбу» нажат, но окно подтверждения не появилось "
+                                           f"или «Прекратить» не нажалось для {who}", over=over, menu=menu)
+        # 5) успех — окно подтверждения закрылось; ОК на его месте показывает «Этот человек удалён из
         #    списка ваших друзей» с кнопкой «Закрыть» — его закрываем, иначе оно перекроет следующие карточки
         end = time.monotonic() + CONFIRM_S
         while time.monotonic() < end:
@@ -934,7 +1004,7 @@ class DeleteRun(Session):
                     raise
         over = self.over()
         self.close_dialogs()
-        self.not_confirmed(uid, f"окно подтверждения не закрылось после «Прекратить» для {who}", over=over)
+        self.not_confirmed(uid, f"окно подтверждения не закрылось после «Прекратить» для {who}", over=over, menu=menu)
 
     def close_result(self) -> None:
         """Закрыть окно «удалён из списка ваших друзей»: «Закрыть» → Escape → перезагрузка списка."""
@@ -975,8 +1045,9 @@ class DeleteRun(Session):
                 continue
             if not uids:
                 total = len(self.page.evaluate(JS_FR_UIDS, SEL["fr_item"]))
+                nf = f", не друзей {len(self.not_friends)}" if self.not_friends else ""
                 self.finish(f"Список пройден: осталось {total}, их не трогаем "
-                            f"(do_not_delete.txt или не подтвердилось)")
+                            f"(do_not_delete.txt, не друзья или не подтвердилось{nf})")
             for uid in uids:
                 self.guard()
                 self.delete_one(uid)

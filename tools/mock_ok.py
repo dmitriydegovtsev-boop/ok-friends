@@ -15,7 +15,15 @@
   limit_after=N — после N принятых каждое «Принять» отвечает окном «максимальное количество друзей»;
   stale_after=N — после N успешных действий на одной загрузке страницы меню друга перестаёт всплывать, а
                   «Принять» перестаёт работать (как у друга 26.10), перезагрузка страницы лечит;
-  nomenu_all=1 — меню не всплывает ни у кого.
+  nomenu_all=1 — меню не всплывает ни у кого;
+  (v0.2.2) aria=sp — у пункта «Прекратить дружбу» aria-label с пробелом впереди (« Прекратить дружбу», как у ОК
+           27.10 « Написать сообщение»), aria=none — без aria-label, только текст;
+  notfriend=1 — друзья 12 и 21 не друзья: в меню «Отменить заявку» / «Отписаться», «Прекратить дружбу» нет;
+  pop_on_menu=1 — в момент, когда всплывает меню, всплывает и уведомление «… хочет с вами подружиться» с крестиком:
+                  Escape, клик по крестику (клик мимо меню) — меню закрывается, как у ОК.
+Меню друга как на ok.ru 27.10.2026: общий #hook_Block_ShortcutMenu в body, на каждое наведение — новый
+div.sc-menu#block_ShortcutMenu_FriendControlMenu_<число> (имя в .sc-menu_user_n), прежние получают sc-menu__hidden
+и уезжают за левый край; у аватара, чьё меню открыто, класс __vis; Escape и клик мимо меню его закрывают.
 Как на настоящем ОК (24.10.2026): рекламная плашка #hook_Block_FixedPromoBanner внизу слева поверх карточек;
 кнопки начинают работать только после полной загрузки (картинка /slow.png отдаётся через 1,5 с); после
 «Прекратить» вместо окна подтверждения — окно «Этот человек удалён из списка ваших друзей» с «Закрыть»;
@@ -35,20 +43,20 @@ body{font-family:sans-serif;margin:0;padding:%dpx 20px 20px}
 #topPanel{position:fixed;left:0;top:0;right:0;height:%dpx;background:#eee;border-bottom:1px solid #ccc;z-index:2601}
 .js-entity-item,.user-grid-card{border:1px solid #ccc;margin:6px;padding:8px;width:520px;position:relative}
 .user-grid-card{display:inline-block;width:150px;vertical-align:top}
-.user-grid-card_img{width:120px;height:120px;background:#c9d6e3}
-.sc-menu{position:absolute;left:-10px;top:110px;width:160px;height:240px;background:#fff;border:1px solid #888;padding:6px;z-index:5}
-.sc-menu a{position:absolute;bottom:8px}
+.user-grid-card_img{display:block;width:120px;height:120px;background:#c9d6e3}
+.sc-menu{position:absolute;width:200px;background:#fff;border:1px solid #888;padding:6px;z-index:5}
+.sc-menu .u-menu{list-style:none;margin:0;padding:0}.sc-menu .u-menu_a{display:block;padding:3px 0}
 .backdrop{position:fixed;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,.3);z-index:9}
 .fixed_promo_banner_promo-banner{position:fixed;left:20px;bottom:20px;width:382px;height:178px;z-index:4000;background:#f60}
-.sc-menu__hidden{display:none}
-.sc-menu__top{top:-250px}
+.sc-menu__hidden{visibility:hidden;opacity:0}
 .__error{color:#c00}
 .nav_menu_tab{margin-right:12px}
 #hook_Modal_popLayerModal,.modal-new{position:fixed;left:30%%;top:30%%;background:#fff;border:2px solid #333;padding:20px;z-index:10}
 .growl,.ntf-popup{position:fixed;left:10px;top:52px;width:420px;height:140px;z-index:3000;background:#fffbe6;border:1px solid #999}
 </style>"""
 
-INT_KEYS = ("toast", "rec", "header", "fr_base", "limit_after", "stale_after", "nomenu_all", "fr_page")
+INT_KEYS = ("toast", "rec", "header", "fr_base", "limit_after", "stale_after", "nomenu_all", "fr_page", "notfriend",
+            "pop_on_menu")
 FLAG_KEYS = ("captcha", "cert", "silent_all", "own_limit")
 
 
@@ -59,11 +67,12 @@ def default_state(nreq=45, nfr=30):
         reqs.append({"id": str(1000 + i), "name": f"Заявитель {i}", "kind": kind, "done": False})
     friends = []
     for i in range(1, nfr + 1):
-        kind = {4: "silent", 9: "nomenu"}.get(i, "ok")
+        kind = {4: "silent", 9: "nomenu", 12: "nf_request", 21: "nf_sub"}.get(i, "ok")
         friends.append({"id": str(2000 + i), "name": f"Друг {i}", "kind": kind, "gone": False})
     st = {"reqs": reqs, "friends": friends, "accept_log": [], "unfriend_log": [], "fr_text": "",
           "actions": 0, "toast_at": 0, "toast_shown": 0, "toast_closed": 0, "toast_accept": 0, "rec_add": 0,
-          "loads": {"friends": 0, "requests": 0}}
+          "loads": {"friends": 0, "requests": 0}, "aria": "", "menu_opens": {}, "menu_pops": 0,
+          "menu_lost": 0, "lost_log": [], "wrong_item": []}
     st.update({k: False for k in FLAG_KEYS})
     st.update({k: 0 for k in INT_KEYS})
     st["fr_page"] = 25
@@ -100,11 +109,17 @@ def req_cards(items):
         for r in items)
 
 
+def fr_kind(f):
+    # notfriend=1: у 12 и 21 в меню нет «Прекратить дружбу» (исходящая заявка / подписка)
+    return f["kind"] if f["kind"] in ("ok", "silent", "nomenu") or STATE["notfriend"] else "ok"
+
+
 def fr_cards(items):
+    # как на ok.ru 27.10.2026: аватар — a.user-grid-card_img с aria-label=имя, меню — не в карточке (общий блок)
     return "".join(
-        f"<div class='user-grid-card' data-id='{f['id']}' data-kind='{f['kind']}'><div class='user-grid-card_img'></div>"
-        f"<div class='user-grid-card_name'><a href='/profile/{f['id']}'>{f['name']}</a></div>"
-        f"<div class='sc-menu sc-menu__hidden'><div>{f['name']}</div><a class='u-menu_a' aria-label='Прекратить дружбу' href='#'>Прекратить дружбу</a></div></div>"
+        f"<div class='user-grid-card' data-id='{f['id']}' data-kind='{fr_kind(f)}'>"
+        f"<a class='user-grid-card_img' aria-label='{f['name']}' href='/profile/{f['id']}'></a>"
+        f"<div class='user-grid-card_name'><a href='/profile/{f['id']}'>{f['name']}</a></div></div>"
         for f in items)
 
 
@@ -176,35 +191,81 @@ window.addEventListener('scroll', async () => {
 
 FR_JS = """<script>
 let offset = %d;
-const STALE = %d, NOMENU = %d;
+const STALE = %d, NOMENU = %d, ARIA = '%s', POP = %d;
+const ITEMS = {
+  ok: ['Увеличить фото', ' Написать сообщение', 'Позвонить', 'Пригласить в группу', 'Сделать подарок', 'Фотографии',
+       'Друзья друга', '*'],
+  nf_request: ['Увеличить фото', ' Написать сообщение', 'Пригласить в группу', 'Отменить заявку', 'Пожаловаться'],
+  nf_sub: ['Увеличить фото', ' Написать сообщение', 'Отписаться', 'Пожаловаться', 'Заблокировать'],
+};
+const host = () => document.querySelector('#hook_Block_ShortcutMenu > div');
+let cur = null, hideT = null, showT = null;
+function hideMenu(why) {
+  clearTimeout(hideT); clearTimeout(showT);
+  if (!cur) return;
+  // why — программа закрыла меню (Escape / клик мимо); mine — мышь в этот миг была на этом меню или его аватаре
+  if (why) fetch('/api/menu_lost?why=' + why + '&id=' + cur.m.dataset.uid + '&mine=' + (cur.m.matches(':hover') || cur.img.matches(':hover') ? 1 : 0), {method: 'POST'});
+  cur.m.classList.add('sc-menu__hidden'); cur.m.style.left = (-9000 - Math.random() * 900 | 0) + 'px';
+  cur.img.classList.remove('__vis'); cur = null;
+}
+function showMenu(img) {
+  const card = img.closest('.user-grid-card'), kind = card.dataset.kind;
+  if (kind === 'nomenu' || NOMENU || (STALE && window.okDone >= STALE)) return;   // «залипшая» страница — меню нет
+  hideMenu();
+  const name = card.querySelector('.user-grid-card_name a').textContent;
+  const li = (ITEMS[kind] || ITEMS.ok).map(t => {
+    if (t !== '*') return '<li class="u-menu_li"><a class="u-menu_a" aria-label="' + t + '" href="#"><div class="tico">' + t + '</div></a></li>';
+    const aria = ARIA === 'sp' ? ' aria-label=" Прекратить дружбу"' : ARIA === 'none' ? '' : ' aria-label="Прекратить дружбу"';
+    return '<li class="sc-menu_splitter"></li><li class="u-menu_li"><a class="u-menu_a js-unfriend"' + aria + ' href="#"><div class="tico"> Прекратить дружбу</div></a></li>';
+  }).join('');
+  const r = img.getBoundingClientRect(), up = r.bottom + 260 > innerHeight;
+  host().insertAdjacentHTML('beforeend', '<div class="sc-menu' + (up ? ' sc-menu__top' : '') + '" data-l="t,shortcutMenu" id="block_ShortcutMenu_FriendControlMenu_' +
+    (Math.random() * 1e10 | 0) + '" data-uid="' + card.dataset.id + '"><div class="sc-menu_user"><div class="sc-menu_user_n ellip">' + name +
+    '</div><div class="sc-menu_splitter"></div></div><ul class="u-menu">' + li + '</ul></div>');
+  const m = host().lastElementChild, h = m.offsetHeight;
+  // как у ОК: меню у левого края аватара, над ним (sc-menu__top) или под ним, слегка заходя на аватар
+  m.style.left = (r.left + scrollX - 20) + 'px';
+  m.style.top = (up ? r.top + scrollY - h + 20 : r.bottom + scrollY - 20) + 'px';
+  img.classList.add('__vis'); cur = {m, img};
+  fetch('/api/menu?id=' + card.dataset.id, {method: 'POST'});
+  if (POP) {   // уведомление ОК в тот же миг: программа не должна закрывать его, пока меню открыто
+    document.querySelectorAll('#NotificationsGrowl').forEach(e => e.remove());
+    document.body.insertAdjacentHTML('beforeend', '<div id="NotificationsGrowl" class="h-mod"><div id="hook_Block_NotificationsGrowl_Content"><div class="growl __active">' +
+      '<div class="growl_cnt"><div class="growl_tx"><div class="growl_name">Гость ' + card.dataset.id + '</div> хочет с\\u00a0вами подружиться ' +
+      '<a class="al growl_open toast-accept">Принять</a></div></div><span class="ic growl_close" title="скрыть">×</span></div></div></div>');
+  }
+}
 document.addEventListener('mouseover', ev => {
-  const img = ev.target.closest('.user-grid-card_img'); if (!img) return;
-  const card = img.closest('.user-grid-card'); if (card.dataset.kind === 'nomenu' || NOMENU) return;
-  if (STALE && window.okDone >= STALE) return;   // страница «залипла»: меню не всплывает до перезагрузки
-  const m = card.querySelector('.sc-menu'); if (!m) return;
-  document.querySelectorAll('.sc-menu').forEach(m => m.classList.add('sc-menu__hidden'));
-  // как у ОК: внизу мало места — меню открывается вверх
-  m.classList.toggle('sc-menu__top', img.getBoundingClientRect().bottom + 260 > window.innerHeight);
-  m.classList.remove('sc-menu__hidden');
+  const img = ev.target.closest('.user-grid-card_img');
+  if (cur && (cur.m.contains(ev.target) || cur.img === img)) { clearTimeout(hideT); return; }
+  if (!img) return;
+  clearTimeout(showT); showT = setTimeout(() => showMenu(img), 120);
 });
 document.addEventListener('mouseout', ev => {
-  const card = ev.target.closest('.user-grid-card'); if (!card || card.contains(ev.relatedTarget)) return;
-  const m = card.querySelector('.sc-menu'); if (m) setTimeout(() => m.classList.add('sc-menu__hidden'), 300);
+  if (!cur) { if (ev.target.closest('.user-grid-card_img')) clearTimeout(showT); return; }
+  const to = ev.relatedTarget;
+  if (to && (cur.m.contains(to) || cur.img.contains(to))) return;
+  if (!(cur.m.contains(ev.target) || cur.img.contains(ev.target))) return;
+  clearTimeout(hideT); hideT = setTimeout(() => hideMenu(), 300);
 });
+document.addEventListener('mousedown', ev => { if (cur && !cur.m.contains(ev.target)) hideMenu('click'); }, true);
+document.addEventListener('click', ev => { if (cur && !cur.m.contains(ev.target) && ev.isTrusted === false) hideMenu('click'); }, true);
 window.addEventListener('load', () => document.addEventListener('click', async ev => {
-  const a = ev.target.closest('a.u-menu_a');
-  if (a) { ev.preventDefault(); const card = a.closest('.user-grid-card');
+  const a = ev.target.closest('.sc-menu a.u-menu_a');
+  if (a) { ev.preventDefault(); const uid = a.closest('.sc-menu').dataset.uid;
+    if (!a.classList.contains('js-unfriend')) { fetch('/api/wrong_item?id=' + uid + '&t=' + encodeURIComponent(a.textContent.trim()), {method: 'POST'}); return; }
+    hideMenu();
     document.body.insertAdjacentHTML('beforeend', '<div class="backdrop"></div><div id="hook_Modal_popLayerModal"><div>Прекратить дружбу?</div>' +
-      '<input type="hidden" id="field_userIds" value="' + card.dataset.id + '"><button id="hook_FormButton_button_delete_confirm">Прекратить</button></div>'); return; }
+      '<input type="hidden" id="field_userIds" value="' + uid + '"><button id="hook_FormButton_button_delete_confirm">Прекратить</button></div>'); return; }
   const b = ev.target.closest('#hook_FormButton_button_delete_confirm');
   if (b) { const id = document.querySelector('#field_userIds').value;
     const r = await (await fetch('/api/unfriend?id=' + id, {method: 'POST'})).json();
     if (r.kind === 'ok') setTimeout(() => { window.okDone++; document.querySelector('#hook_Modal_popLayerModal').innerHTML =
-      '<div>Прекратить дружбу</div><div>Этот человек удалён из списка ваших друзей.</div><button class="js-close">Закрыть</button>'; }, 300); }
+      '<div>Прекратить дружбу</div><div>Этот человек удалён из списка ваших друзей.</div><button class="js-close">Закрыть</button>'; }, 300); }
   const c = ev.target.closest('.js-close');
   if (c) { document.querySelector('#hook_Modal_popLayerModal').remove(); document.querySelector('.backdrop').remove(); }
 }));
-document.addEventListener('keydown', ev => { if (ev.key === 'Escape') { document.querySelectorAll('#hook_Modal_popLayerModal, .backdrop').forEach(m => m.remove()); } });
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') { hideMenu('escape'); document.querySelectorAll('#hook_Modal_popLayerModal, .backdrop').forEach(m => m.remove()); } });
 window.addEventListener('scroll', async () => {
   if (window.innerHeight + window.scrollY < document.body.scrollHeight - 50 || window.loading) return;
   window.loading = true;
@@ -256,6 +317,8 @@ class Handler(BaseHTTPRequestHandler):
                         STATE[k] = int(q[k])
                 if "fr_text" in q:
                     STATE["fr_text"] = q["fr_text"]
+                if "aria" in q:
+                    STATE["aria"] = q["aria"]
                 return self.send(json.dumps({k: STATE[k] for k in FLAG_KEYS + INT_KEYS + ("fr_text",)}, ensure_ascii=False),
                                  "application/json")
             if u.path == "/slow.png":
@@ -304,7 +367,8 @@ class Handler(BaseHTTPRequestHandler):
                            f"{rec_cards(4)}</div>")
                 inside = rec_cards(1, 9) if STATE["rec"] == 2 else ""
                 return self.page(f"{rec}<div data-block='MyFriendsSquareCardsPagingB'>{inside}{fr_cards(friends[:fp])}</div>",
-                                 FR_JS % (fp, STATE["stale_after"], STATE["nomenu_all"], fp))
+                                 (FR_JS % (fp, STATE["stale_after"], STATE["nomenu_all"], STATE["aria"], STATE["pop_on_menu"], fp))
+                                 + "<div id='hook_Block_ShortcutMenu'><div></div></div>")
             if u.path == "/api/friends":
                 o = int(q.get("offset", 0))
                 return self.send(fr_cards(friends[o:o + fp]))
@@ -335,9 +399,20 @@ class Handler(BaseHTTPRequestHandler):
                     r["done"] = True
                     STATE["actions"] += 1
                 return self.send(json.dumps({"kind": kind}), "application/json")
+            if u.path == "/api/menu":
+                STATE["menu_opens"][q.get("id")] = STATE["menu_opens"].get(q.get("id"), 0) + 1
+                STATE["menu_pops"] += 1 if STATE["pop_on_menu"] else 0
+                return self.send("{}", "application/json")
+            if u.path == "/api/menu_lost":
+                STATE["menu_lost"] += 1
+                STATE["lost_log"].append([q.get("id"), q.get("why"), q.get("mine")])
+                return self.send("{}", "application/json")
+            if u.path == "/api/wrong_item":
+                STATE["wrong_item"].append([q.get("id"), q.get("t")])
+                return self.send("{}", "application/json")
             if u.path == "/api/unfriend":
                 f = next((f for f in STATE["friends"] if f["id"] == q.get("id")), None)
-                kind = f["kind"] if f else "silent"
+                kind = fr_kind(f) if f else "silent"
                 STATE["unfriend_log"].append([round(time.time(), 3), q.get("id"), kind])
                 if kind == "ok":
                     f["gone"] = True

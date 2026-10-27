@@ -1,8 +1,10 @@
-"""Проверка быстрого режима (v0.2.0–v0.2.1) через настоящее окно программы (кнопки нажимаются .invoke()).
+"""Проверка быстрого режима (v0.2.0–v0.2.2) через настоящее окно программы (кнопки нажимаются .invoke()).
 
   python tools/test_fast.py mock   — сухой прогон на макете ОК (tools/mock_ok.py) в отдельной папке,
                                      файлы программы и аккаунт «Павел.» не трогаются
   python tools/test_fast.py mocknew — только сценарии v0.2.1 (всплывашки, рекомендации, шапка, 6000, перезагрузки)
+  python tools/test_fast.py mock022 — только сценарии v0.2.2 (меню друга: уведомление в момент меню, пункт без
+                                     точного aria-label, «не друг» в меню)
   python tools/test_fast.py real   — аккаунт «Павел.» на настоящем ok.ru: вход, приём, удаление, «Стоп»,
                                      отметка инцидента и «Сбросить и продолжить»
   python tools/test_fast.py realdel N — аккаунт «Павел.»: живое удаление N друзей (лимит за запуск = N)
@@ -29,7 +31,7 @@ SCENARIO = sys.argv[1] if len(sys.argv) > 1 else "mock"
 PORT = 8765
 MOCK = f"http://127.0.0.1:{PORT}"
 
-if SCENARIO in ("mock", "mocknew"):
+if SCENARIO in ("mock", "mocknew", "mock022"):
     base = Path(os.environ.get("OKF_TEST_BASE", "/tmp/okf_fast_test"))
     if base.exists():
         shutil.rmtree(base)
@@ -377,10 +379,64 @@ def scenario_mock_new(d: Driver):
     check(f"«{modes.MSG_STUCK}», ни одного «Прекратить»", s == modes.MSG_STUCK and not st["unfriend_log"],
           f"{s}; загрузок списка {st['loads']['friends']}")
     check("3 перезагрузки восстановления, в журнале — что поверх точки наведения",
-          lt.count("перезагружаю страницу (перезагрузка") == 3 and "поверх точки: сама цель (div.user-grid-card_img" in lt,
+          lt.count("перезагружаю страницу (перезагрузка") == 3 and "поверх точки: сама цель (a.user-grid-card_img" in lt,
           [l for l in lt.splitlines() if "поверх точки" in l][:1])
     shots = [p.name for p in paths.SCREENSHOTS.iterdir() if p.name.endswith("_recover.png")]
     check("скриншоты перед перезагрузками", len(shots) >= 3, str(len(shots)))
+
+
+
+
+# ---------------------------------------------------------------- сухой прогон v0.2.2
+def scenario_mock_022(d: Driver):
+    store.update_account(ACC, run_limit=6000)
+    d.ui(d.app._load_accounts)
+    keep = paths.DO_NOT_DELETE.read_text(encoding="utf-8") if paths.DO_NOT_DELETE.exists() else ""
+    if "/2015" not in keep:
+        with paths.DO_NOT_DELETE.open("a", encoding="utf-8") as f:
+            f.write("https://ok.ru/profile/2015\n")
+
+    def run(ctl, timeout=300):
+        d.idle(timeout=900)
+        mock("/ctl?reset=1&" + ctl)
+        log0 = len(log_text())
+        d.ui(lambda: d.app._status.__setitem__(ACC, ""))
+        d.press("btn_delete")
+        s = d.wait_status(lambda s: s.startswith("Список пройден") or s.startswith("Друзья кончились")
+                          or s == modes.MSG_STUCK or s.startswith("Ошибка"), timeout)
+        d.idle()
+        return s, mock("/state"), log_text()[log0:]
+
+    print("17) в момент, когда всплывает меню друга, всплывает и уведомление «… хочет с вами подружиться»: "
+          "Escape/закрытие уведомления после наведения закрыли бы меню")
+    s, st, lt = run("pop_on_menu=1")
+    gone = sum(1 for f in st["friends"] if f["gone"])
+    check("удалено 27, «Список пройден: осталось 3»", gone == 27 and s.startswith("Список пройден: осталось 3"), f"{s}; удалено {gone}")
+    check("меню ни разу не закрыто программой (Escape или клик мимо меню после наведения)", st["menu_lost"] == 0,
+          f"закрыто {st['menu_lost']} из {st['menu_pops']} меню с уведомлением; [кого, чем, мышь на нём]: {st['lost_log'][:6]}")
+    check("«Принять» в уведомлении не нажато, чужие пункты меню не нажаты", st["toast_accept"] == 0 and not st["wrong_item"],
+          f"«Принять» {st['toast_accept']}, чужие пункты {st['wrong_item'][:3]}")
+    for aria, what in (("sp", "aria-label « Прекратить дружбу» (с пробелом впереди)"), ("none", "без aria-label, только текст")):
+        print(f"18{'а' if aria == 'sp' else 'б'}) пункт меню {what}: меню видно, «Прекратить дружбу» в нём есть")
+        s, st, lt = run("aria=" + aria)
+        gone = sum(1 for f in st["friends"] if f["gone"])
+        check(f"удалено 27, не подтвердились только 2 (молчит, без меню)",
+              gone == 27 and unconfirmed_people(lt) == {"2004", "2009"}, f"{s}; удалено {gone}; не подтверждены "
+              f"{sorted(unconfirmed_people(lt))[:6]}; {[l for l in lt.splitlines() if 'не подтверждено' in l][:1]}")
+    print("19) в меню двоих нет «Прекратить дружбу» (у одного «Отменить заявку», у другого «Отписаться»)")
+    s, st, lt = run("notfriend=1")
+    gone = sum(1 for f in st["friends"] if f["gone"])
+    check("удалено 25, «Список пройден: осталось 5»", gone == 25 and s.startswith("Список пройден: осталось 5"), f"{s}; удалено {gone}")
+    nf = [l for l in lt.splitlines() if "не друг (в меню:" in l]
+    check("в журнале «не друг (в меню: …)» у обоих, с пунктами меню",
+          len(nf) == 2 and any("Отменить заявку" in l for l in nf) and any("Отписаться" in l for l in nf), nf[:2])
+    check("«не друг» не считается неподтверждённым, перезагрузок восстановления нет",
+          unconfirmed_people(lt) == {"2004", "2009"} and "перезагружаю страницу (перезагрузка" not in lt,
+          f"не подтверждены {sorted(unconfirmed_people(lt))}")
+    opens = {k: v for k, v in st["menu_opens"].items() if k in ("2012", "2021")}
+    check("к «не другу» не возвращаемся: меню каждого открыто не больше 2 раз", opens and max(opens.values()) <= 2, str(opens))
+    check("«Отменить заявку»/«Отписаться» не нажаты", not st["wrong_item"], str(st["wrong_item"][:3]))
+
 
 
 # ---------------------------------------------------------------- настоящий ok.ru
@@ -471,7 +527,7 @@ def scenario_cert(d: Driver):
 
 def main():
     srv = None
-    if SCENARIO in ("mock", "mocknew"):
+    if SCENARIO in ("mock", "mocknew", "mock022"):
         sys.path.insert(0, str(ROOT / "tools"))
         import mock_ok
         srv = mock_ok.serve(PORT)
@@ -482,7 +538,8 @@ def main():
 
     def run():
         try:
-            {"mock": lambda d: (scenario_mock(d), scenario_mock_new(d)), "mocknew": scenario_mock_new, "real": scenario_real, "realdel": scenario_realdel, "cert": scenario_cert}[SCENARIO](d)
+            {"mock": lambda d: (scenario_mock(d), scenario_mock_new(d), scenario_mock_022(d)), "mocknew": scenario_mock_new,
+             "mock022": scenario_mock_022, "real": scenario_real, "realdel": scenario_realdel, "cert": scenario_cert}[SCENARIO](d)
         except Exception:
             traceback.print_exc()
             check("сценарий без исключений", False)
