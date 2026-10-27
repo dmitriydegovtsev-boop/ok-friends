@@ -1,4 +1,4 @@
-"""Режимы «Принять заявки» и «Удалить друзей» (быстрый режим, v0.2.0): клики подряд по видимым
+"""Режимы «Принять заявки» и «Удалить друзей» (быстрый режим, v0.2.0–v0.2.1): клики подряд по видимым
 карточкам, пауза 0,7–1,5 с, после порции — перезагрузка списка."""
 import os
 import random
@@ -40,8 +40,13 @@ SEL = {
 
 PAUSE = (0.7, 1.5)          # пауза между кликами, с
 CONFIRM_S = 5.0             # сколько ждать ответа ОК на одно действие
-MAX_UNCONFIRMED = 10        # столько неподтверждённых подряд — остановка
-UNCONFIRMED_SHOTS = 5       # скриншотов неподтверждённых за запуск (кроме остановки)
+RECOVER_AFTER = 3           # столько неподтверждённых подряд — закрыть окна и перезагрузить страницу
+MAX_RECOVERIES = 3          # столько таких перезагрузок подряд без единого успеха — остановка
+RELOAD_EVERY = (30, 50)     # профилактическая перезагрузка страницы через столько действий (случайно)
+UNCONFIRMED_SHOTS = 5       # скриншотов неподтверждённых за запуск (кроме перезагрузок и остановки)
+OWN_CAP = 5990              # столько своих друзей по счётчику — приём не начинаем (потолок ОК 6000)
+RECOUNT_EVERY = 100         # перечитывать свой счётчик друзей не реже, чем через столько принятий
+LIMIT_STREAK = 3            # столько окон «максимальное количество друзей» подряд — это наш потолок
 
 INCIDENT_TEXTS = re.compile(
     r"введите код с картинки|подтвердите, что вы не робот|подтвердите номер|подтвердите телефон|"
@@ -58,8 +63,92 @@ OWN_LIMIT = re.compile(
 DIALOG_WORDS = r"максимальн|друз|нельзя|лимит|предел|не может|не можете"
 
 MSG_HELP = "Нужна ваша помощь — смотрите окно браузера. Когда разберётесь, нажмите «Сбросить и продолжить»"
-MSG_CEILING = "Похоже, достигнут потолок друзей ОК. Можно приглашать в группу"
-MSG_UNCONFIRMED = f"{MAX_UNCONFIRMED} действий подряд не подтвердились — остановлено, смотрите окно браузера"
+MSG_CEILING = "Друзей уже около 6000 — пригласи в группу и запусти удаление"
+MSG_STUCK = "Не получается продолжить — смотрите окно браузера"
+
+# Всплывающие уведомления ОК (найдено 27.10.2026 на «Павел.»): #NotificationsGrowl → .growl.__active,
+# крестик .growl_close (title «скрыть»), рядом ссылка «Дружить»/«Принять» — её не трогаем никогда.
+# Прячем у себя на странице стилем, как рекламную плашку; на сервер ОК ничего не уходит.
+HIDE_CSS = ("#hook_Block_FixedPromoBanner, [class*='fixed_promo'], [class*='fixed-promo'], #NotificationsGrowl, "
+            "#hook_Block_NotificationsGrowl_Content, .growl, .toast, .fixed-toast, [class*='Toast_wrapper'], "
+            "[class*='ToastAlert_wrapper'], .hobby_toast_manager_toast {display: none !important}")
+# Перед каждым действием: закрыть видимые всплывашки крестиком, спрятать их, повесить стиль. Незнакомые
+# всплывашки — по признакам: текст про дружбу/заявку, сидит в fixed-элементе, внутри есть крестик или «Принять».
+JS_PREP = """(css) => {
+  const out = {closed: [], hidden: document.visibilityState === 'hidden'};
+  const vis = e => { const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+    return r.width > 2 && r.height > 2 && st.display !== 'none' && st.visibility !== 'hidden'; };
+  const txt = e => (e.innerText || e.textContent || '').replace(/\\s+/g, ' ').trim();
+  const KEEP = "[data-block='MyFriendsSquareCardsPagingB'], #hook_Block_UserFriendRequestMRB, #hook_Modal_popLayerModal, .sc-menu";
+  const BAD = /принять|дружить|добавить|перейти|ответить|подписаться|открыть|прекратить/i;
+  const isClose = b => /close|закрыть|скрыть/i.test((b.className && b.className.baseVal !== undefined ? b.className.baseVal : b.className || '') + ' ' +
+      (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '')) || /^[×✕✖x]$/i.test(txt(b));
+  const fixedUp = e => { for (let p = e; p && p !== document.body; p = p.parentElement) if (getComputedStyle(p).position === 'fixed') return true; return false; };
+  const roots = new Set();
+  document.querySelectorAll(".growl, .toast, .fixed-toast, [class*='Toast_wrapper'], [class*='ToastAlert_wrapper'], .hobby_toast_manager_toast").forEach(e => roots.add(e));
+  const xp = document.evaluate("//text()[contains(., 'ружит') or contains(., 'в друзья') or contains(., 'рекомендуем') or contains(., 'заявк')]",
+                               document.body, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+  for (let i = 0; i < xp.snapshotLength && i < 400; i++) {
+    let e = xp.snapshotItem(i).parentElement;
+    if (!e || e.closest(KEEP) || !fixedUp(e)) continue;
+    // корень всплывашки — ближайший предок с крестиком или кнопкой «Принять», не шире 700 и не выше 400
+    for (let p = e, n = 0; p && p !== document.body && n < 8; p = p.parentElement, n++) {
+      const r = p.getBoundingClientRect();
+      if (r.width > 700 || r.height > 400) break;
+      if ([...p.querySelectorAll('*')].some(b => isClose(b) || /^принять$/i.test(txt(b)))) { roots.add(p); break; }
+    }
+  }
+  for (const t of roots) {
+    if (!t.isConnected || t.closest(KEEP) || !vis(t)) continue;
+    const text = txt(t);
+    if (!/ружит|в друзья|рекомендуем|заявк|друз/i.test(text) && !t.matches(".growl, .toast, .fixed-toast, [class*='Toast']")) continue;
+    const x = [...t.querySelectorAll('*')].filter(vis).find(b => isClose(b) && !BAD.test(txt(b)));
+    if (x) x.click();
+    t.style.setProperty('display', 'none', 'important');
+    out.closed.push((x ? '' : 'без крестика: ') + text.slice(0, 70));
+  }
+  if (!document.getElementById('okf-hide')) {
+    const s = document.createElement('style'); s.id = 'okf-hide'; s.textContent = css;
+    (document.head || document.documentElement).appendChild(s);
+  }
+  return out;
+}"""
+# Что лежит в точке: тег#id.классы «первые слова текста»
+JS_DESCRIBE = """function okfDescribe(t) {
+  if (!t) return 'ничего (точка вне окна)';
+  const cls = (typeof t.className === 'string' ? t.className : (t.className && t.className.baseVal) || '').trim().split(/\\s+/).filter(Boolean).slice(0, 3);
+  const words = (t.innerText || t.textContent || '').replace(/\\s+/g, ' ').trim().split(' ').slice(0, 6).join(' ');
+  return t.tagName.toLowerCase() + (t.id ? '#' + t.id : '') + (cls.length ? '.' + cls.join('.') : '') + (words ? ' «' + words.slice(0, 60) + '»' : '');
+}"""
+# Цель в видимую зону: карточку в середину окна по вертикали, затем точка цели, которую ничто не перекрывает
+JS_AIM = """([sel, shift]) => {
+  """ + JS_DESCRIBE + """
+  const el = [...document.querySelectorAll(sel)].find(e => e.offsetWidth || e.offsetHeight);
+  if (!el) return {err: 'элемент не найден'};
+  let r = el.getBoundingClientRect();
+  const H = innerHeight;
+  if (shift) window.scrollBy(0, shift);
+  else if (r.top < H * 0.25 || r.bottom > H * 0.75) el.scrollIntoView({block: 'center', inline: 'nearest'});
+  r = el.getBoundingClientRect();
+  const pts = [[.5, .5], [.5, .7], [.5, .3], [.3, .5], [.7, .5], [.5, .85], [.5, .15], [.25, .8], [.75, .8]];
+  for (const [fx, fy] of pts) {
+    const x = r.left + r.width * fx, y = r.top + r.height * fy;
+    if (x < 1 || y < 1 || x > innerWidth - 2 || y > H - 2) continue;
+    const t = document.elementFromPoint(x, y);
+    if (t && (t === el || el.contains(t))) return {x, y};
+  }
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2, t = document.elementFromPoint(cx, cy);
+  // поверх — меню предыдущего друга, которое ещё не спряталось: это лечится отводом мыши, а не прокруткой
+  return {x: cx, y: cy, blocked: okfDescribe(t), menu: !!(t && t.closest('.sc-menu'))};
+}"""
+# что поверх точки (x, y) и попадает ли она в элемент sel
+JS_OVER = """([x, y, sel]) => {
+  """ + JS_DESCRIBE + """
+  const t = document.elementFromPoint(x, y);
+  const el = sel ? [...document.querySelectorAll(sel)].find(e => e.offsetWidth || e.offsetHeight) : null;
+  if (t && el && (t === el || el.contains(t))) return 'сама цель (' + okfDescribe(t) + ')';
+  return okfDescribe(t);
+}"""
 
 # видимые окна поверх страницы: текст каждого
 JS_DIALOGS = """() => {
@@ -108,6 +197,34 @@ def norm(text: str) -> str:
     return " ".join((text or "").replace("\xa0", " ").split())
 
 
+def parse_count(text: str) -> int | None:
+    """Число со счётчика ОК: «5 873», «5\\xa0873», «6K», «5,9K», «5,9 тыс.» → 5873, 6000, 5900. Нет числа — None."""
+    t = norm(text).lower().replace(" ", "").replace(" ", "")
+    m = re.search(r"(\d+)(?:[.,](\d+))?(k|к|тыс)?", t)
+    if not m:
+        return None
+    whole, frac, k = m.groups()
+    if not k:
+        # «1,234» без «K» — это разделитель тысяч, а не дробь
+        return int(whole + (frac or "")) if frac and len(frac) == 3 else int(whole)
+    return int(round(float(f"{whole}.{frac or 0}") * 1000))
+
+
+# свой счётчик друзей: вкладка «Все» на странице друзей и заявок (24.10.2026 давал «9» при 9 друзьях)
+JS_OWN_COUNT = """() => {
+  const tabs = [...document.querySelectorAll("a[data-l='t,userFriend']")];
+  const all = tabs.find(a => /^\\s*Все/.test(a.innerText || a.textContent || ''));
+  const c = (all && all.querySelector('.nav_menu_tab-counter')) || document.querySelector("a[data-l='t,userFriend'] .nav_menu_tab-counter");
+  return c ? (c.innerText || c.textContent || '') : null;
+}"""
+# карточки своих друзей: только из списка друзей; карточки с «Добавить в друзья»/«Дружить» (рекомендации) — никогда
+JS_FR_UIDS = """(sel) => [...document.querySelectorAll(sel)]
+  .filter(c => !/Добавить в друзья|Дружить/i.test(c.innerText || c.textContent || ''))
+  .map(c => c.getAttribute('data-id'))"""
+# окно ОК прямо про наш лимит или прямо про чужой
+PERSON_EXPLICIT = re.compile(r"у (?:пользователя|собеседника|человека|него|неё|нее)\b", re.I)
+
+
 class Incident(Exception):
     pass
 
@@ -130,6 +247,17 @@ class Session:
         self.unconfirmed_shots = 0
         self.skipped = set()                # пропущены в этом запуске (не подтвердилось, лимит у человека)
         self.handled = set()                # уже принятые/удалённые в этом запуске
+        self.fails = {}                     # uid → сколько раз не подтвердилось
+        self.streak = []                    # uid текущей серии неподтверждённых
+        self.recoveries = 0                 # перезагрузок восстановления подряд без успеха
+        self.reload_now = None              # причина перезагрузить страницу до следующего действия
+        self.since_reload = 0
+        self.reload_every = random.randint(*RELOAD_EVERY)
+        self.last_point = None              # куда последний раз целились мышью/кнопкой
+        self.last_target = None
+        self.limit_streak = []              # тексты окон «максимум друзей» подряд (приём)
+        self.limit_seen = 0
+        self.own_count = "не виден"
         self.not_found = 0
         self.urls = {}
 
@@ -234,15 +362,97 @@ class Session:
         self.log(f"не нашёл {what}; скриншот {shot}")
         self.finish(f"Не нашёл {what} — смотрите окно браузера")
 
-    def hide_banners(self) -> None:
-        """Рекламная плашка ОК внизу слева (#hook_Block_FixedPromoBanner, z-index 4000) перекрывает карточки
-        и пункт меню друга, «Скрыть» её не убирает. Прячем у себя на странице, на сервер ничего не уходит.
-        Зовётся перед каждым действием: после окна «удалён из списка» ОК перерисовывает страницу и плашку."""
+    def prep(self) -> None:
+        """Перед каждым действием. Рекламная плашка ОК внизу слева (#hook_Block_FixedPromoBanner, z-index 4000)
+        и всплывашки ОК («… хочет с вами подружиться», «Новый рекомендуемый друг») перекрывают карточки и меню
+        друга: видимые всплывашки закрываем крестиком, всё это прячем у себя на странице стилем, на сервер ничего
+        не уходит. «Принять»/«Дружить» во всплывашке не нажимаются никогда. После окна «удалён из списка» ОК
+        перерисовывает страницу и плашку — поэтому перед каждым действием. Свёрнутое окно Chrome — развернуть."""
         try:
-            self.page.evaluate("() => document.querySelectorAll(\"#hook_Block_FixedPromoBanner, [class*='fixed_promo'],"
-                               " [class*='fixed-promo']\").forEach(e => e.style.setProperty('display', 'none', 'important'))")
-        except Exception:
-            pass
+            res = self.page.evaluate(JS_PREP, HIDE_CSS)
+        except Exception as e:
+            if browser.is_closed_error(e):
+                raise
+            return
+        for t in res.get("closed") or []:
+            self.log(f"закрыто всплывающее уведомление ОК: «{t}»")
+        if res.get("hidden"):
+            self.restore_window()
+
+    def restore_window(self) -> None:
+        """Окно Chrome программы свёрнуто — разворачиваем: в свёрнутом окне меню ОК по наведению может не всплывать."""
+        try:
+            cdp = self.page.context.new_cdp_session(self.page)
+            try:
+                win = cdp.send("Browser.getWindowForTarget")
+                cdp.send("Browser.setWindowBounds", {"windowId": win["windowId"], "bounds": {"windowState": "normal"}})
+            finally:
+                cdp.detach()
+            self.log("окно Chrome программы было свёрнуто — развернул (не сворачивайте его во время работы)")
+            wait(0.7, self.stop)
+        except Stopped:
+            raise
+        except Exception as e:
+            if browser.is_closed_error(e):
+                raise
+            self.log("окно Chrome свёрнуто, развернуть не удалось: " + " ".join(str(e).split())[:120])
+
+    def aim(self, sel: str) -> dict:
+        """Цель (аватар друга, кнопка «Принять») — в середину окна по вертикали, не под шапкой и не под
+        всплывашками; точка на ней, которую ничто не перекрывает (elementFromPoint). Перекрыта — закрыть
+        всплывашки, прокрутить ещё и проверить снова. Возвращает {x, y} или {x, y, blocked: что поверх} / {err}."""
+        res = {}
+        shifts = [0, -160, 160, 0, 0]          # два последних — только после отвода мыши от меню
+        for attempt in range(len(shifts)):
+            shift = shifts[attempt]
+            if attempt == 3 and not res.get("menu"):
+                break
+            if attempt:
+                self.prep()
+            try:
+                res = self.page.evaluate(JS_AIM, [sel, shift])
+            except Exception as e:
+                if browser.is_closed_error(e):
+                    raise
+                return {"err": " ".join(str(e).split())[:100]}
+            if res.get("err"):
+                return res
+            self.last_point, self.last_target = (res["x"], res["y"]), sel
+            if not res.get("blocked"):
+                return res
+            if res.get("menu"):
+                # меню прошлого друга ещё открыто — увести мышь, ОК его спрячет; это не перекрытие,
+                # следующая попытка без прокрутки
+                self.page.mouse.move(5, 5)
+                wait(0.6, self.stop)
+                if attempt + 1 < len(shifts):
+                    shifts[attempt + 1] = 0
+                continue
+            self.log(f"цель перекрыта: {res['blocked']} — прокручиваю и проверяю снова")
+            wait(0.3, self.stop)
+        return res
+
+    def over(self) -> str:
+        """Что сейчас лежит в точке, куда целились последний раз (для журнала при неподтверждённом действии)."""
+        if not self.last_point:
+            return "точка не выбрана"
+        try:
+            return self.page.evaluate(JS_OVER, [*self.last_point, self.last_target])
+        except Exception as e:
+            if browser.is_closed_error(e):
+                raise
+            return "не удалось узнать"
+
+    def own_friends(self) -> int | None:
+        """Свой счётчик друзей с текущей страницы (вкладка «Все»); None — не виден."""
+        try:
+            raw = self.page.evaluate(JS_OWN_COUNT)
+        except Exception as e:
+            if browser.is_closed_error(e):
+                raise
+            raw = None
+        self.own_count = norm(raw) if raw and norm(raw) else "не виден"
+        return parse_count(raw) if raw else None
 
     # ---------- окна ОК поверх страницы ----------
     def dialog_text(self) -> str:
@@ -251,11 +461,15 @@ class Session:
         except Exception:
             return ""
 
-    def close_dialogs(self) -> None:
-        """Закрыть окно ОК: крестик/«Закрыть» внутри окна, затем Escape."""
+    def close_dialogs(self, any_text: bool = False) -> None:
+        """Закрыть окно ОК: крестик/«Закрыть» внутри окна, затем Escape. any_text — любые окна, не только про лимит."""
         try:
-            if self.page.evaluate(JS_TAG_CLOSE, DIALOG_WORDS):
-                self.page.locator("[data-okf-close='1']").first.click(timeout=2000)
+            if self.page.evaluate(JS_TAG_CLOSE, "." if any_text else DIALOG_WORDS):
+                for h in self.page.locator("[data-okf-close='1']").element_handles()[:5]:
+                    try:
+                        h.click(timeout=2000)
+                    except Exception:
+                        pass
         except Exception:
             pass
         try:
@@ -266,31 +480,108 @@ class Session:
         wait(0.3, self.stop)
 
     # ---------- итоги одного действия ----------
-    def confirmed(self) -> None:
+    def confirmed(self, uid: str) -> None:
         self.unconfirmed = 0
+        self.streak = []
+        self.recoveries = 0
+        self.limit_streak = []
+        self.handled.add(uid)
         self.done_run += 1
+        self.since_reload += 1
         store.add_done(self.name, self.mode)
         self.drv.refresh()
+        if self.mode == "accept" and self.done_run % RECOUNT_EVERY == 0:
+            self.reload_now = self.reload_now or "recount"
+        elif self.since_reload >= self.reload_every:
+            self.reload_now = self.reload_now or "profilactic"
 
-    def not_confirmed(self, uid: str, what: str) -> None:
-        """Не подтвердилось: в журнал, человека пропускаем, идём дальше; 10 подряд — остановка."""
+    def not_confirmed(self, uid: str, what: str, over: str | None = None) -> None:
+        """Не подтвердилось: в журнал (и что лежит поверх точки), человека пропускаем, идём дальше;
+        3 подряд — закрыть окна и перезагрузить страницу (recover)."""
+        over = over or self.over()
         self.skipped.add(uid)
+        self.fails[uid] = self.fails.get(uid, 0) + 1
+        self.streak.append(uid)
         self.unconfirmed += 1
         shot = ""
         if self.unconfirmed_shots < UNCONFIRMED_SHOTS:
             self.unconfirmed_shots += 1
             shot = "; скриншот " + self.screenshot("unconfirmed")
-        self.log(f"не подтверждено ({self.unconfirmed} подряд), пропускаю: {what}{shot}")
-        if self.unconfirmed >= MAX_UNCONFIRMED:
-            self.log("скриншот " + self.screenshot("stop"))
-            self.finish(MSG_UNCONFIRMED)
+        self.log(f"не подтверждено ({self.unconfirmed} подряд), пропускаю: {what}; поверх точки: {over}{shot}")
+        if self.unconfirmed >= RECOVER_AFTER:
+            self.recover()
 
-    def person_limit(self, uid: str, name: str) -> None:
+    def recover(self) -> None:
+        """Самовосстановление (у друга 26.10: после нескольких десятков удалений меню ОК перестаёт всплывать,
+        ручная перезагрузка помогает): скриншот, закрыть окна и всплывашки ОК, спрятать плашку, перезагрузить
+        страницу. Люди из этой серии получают ещё одну попытку. 3 перезагрузки подряд без успеха — остановка."""
+        if self.recoveries >= MAX_RECOVERIES:
+            self.log(f"после {MAX_RECOVERIES} перезагрузок подряд ни одного успешного действия; "
+                     f"скриншот {self.screenshot('stop')}")
+            self.finish(MSG_STUCK)
+        self.recoveries += 1
+        self.log(f"{self.unconfirmed} действий подряд не подтвердились — закрываю окна ОК и перезагружаю страницу "
+                 f"(перезагрузка {self.recoveries} из {MAX_RECOVERIES} без успеха); скриншот {self.screenshot('recover')}")
+        self.close_dialogs(any_text=True)
+        try:
+            self.page.keyboard.press("Escape")
+            self.page.mouse.move(5, 5)
+        except Exception as e:
+            if browser.is_closed_error(e):
+                raise
+        self.prep()
+        for uid in self.streak:
+            if self.fails.get(uid, 0) < 2:
+                self.skipped.discard(uid)
+        self.streak = []
+        self.unconfirmed = 0
+        self.reload_now = "recover"
+
+    def note_reload(self) -> None:
+        """В журнал — почему перезагружаем страницу (кроме восстановления: оно пишет само)."""
+        why = {"profilactic": f"профилактическая перезагрузка страницы после {self.since_reload} действий",
+               "recount": f"принято {self.done_run} — перезагружаю страницу и перечитываю свой счётчик друзей"}
+        if self.reload_now in why:
+            self.log(why[self.reload_now])
+
+    def retry_left(self) -> bool:
+        """Список кончился, а у кого-то не подтвердилось ровно один раз (например, последние в списке, когда
+        страница «залипла» и до 3 подряд не дошло) — ещё одна попытка после перезагрузки. Второй раз — нет."""
+        again = [u for u in self.skipped if self.fails.get(u, 0) == 1]
+        if not again:
+            return False
+        for u in again:
+            self.skipped.discard(u)
+        self.log(f"список пройден, но у {len(again)} не подтвердилось один раз — перезагружаю страницу и пробую ещё раз")
+        return True
+
+    def after_reload(self) -> None:
+        self.reload_now = None
+        self.since_reload = 0
+        self.reload_every = random.randint(*RELOAD_EVERY)
+
+    def person_limit(self, uid: str, name: str, text: str) -> None:
+        """Окно/надпись ОК «максимальное количество друзей». Прямо про нас — потолок. Иначе человек пропускается,
+        но 3 таких подряд без единого принятия — тоже наш потолок (у друга 26.10 ОК так отвечал после 6000, а
+        программа шла дальше). Если все три прямо про человека, а свой счётчик заметно ниже 6000 — идём дальше."""
+        self.limit_streak.append(text)
+        if len(self.limit_streak) >= LIMIT_STREAK:
+            own = self.own_friends()
+            if all(PERSON_EXPLICIT.search(t) for t in self.limit_streak) and own is not None and own < OWN_CAP - 100:
+                self.log(f"{LIMIT_STREAK} окна «максимум друзей» подряд, но все про человека, а своих друзей "
+                         f"по счётчику {self.own_count} — продолжаю")
+                self.limit_streak = []
+            else:
+                self.log(f"{LIMIT_STREAK} окна «максимальное количество друзей» подряд — считаю, что это наш потолок; "
+                         f"ОК: «{text[:150]}»; своих друзей по счётчику {self.own_count}; скриншот {self.screenshot('limit')}")
+                self.finish(MSG_CEILING)
         self.close_dialogs()
         self.limit_seen = len(PERSON_LIMIT.findall(self.body_text())) if self.mode == "accept" else 0
         self.skipped.add(uid)
         self.unconfirmed = 0
-        self.log(f"пропуск: у человека максимум друзей — {name} ({uid})")
+        self.streak = []
+        self.log(f"пропуск: у человека максимум друзей — {name} ({uid}); ОК: «{text[:120]}» "
+                 f"({len(self.limit_streak)} подряд)")
 
     # ---------- адреса ----------
     def resolve_urls(self) -> None:
@@ -338,10 +629,20 @@ class AcceptRun(Session):
             wait(2, self.stop)
             return self.open_list()
         self.not_found = 0
-        self.hide_banners()
+        self.after_reload()
+        self.prep()
         # сколько раз фраза о максимуме друзей уже есть на странице: по тексту страницы ловим только новые
         self.limit_seen = len(PERSON_LIMIT.findall(self.body_text()))
         return True
+
+    def check_own_cap(self, say: bool) -> None:
+        """Свой потолок: по счётчику «Все» уже 5990 и больше — не принимаем (ОК не даст больше 6000)."""
+        n = self.own_friends()
+        if say:
+            self.log(f"своих друзей по счётчику: {self.own_count}" + ("" if n is not None else " (число не видно)"))
+        if n is not None and n >= OWN_CAP:
+            self.log(f"своих друзей {self.own_count} — это {n}, не меньше {OWN_CAP}; приём не начинаю")
+            self.finish(MSG_CEILING)
 
     def counter(self) -> str:
         try:
@@ -364,19 +665,33 @@ class AcceptRun(Session):
         return out
 
     def accept_one(self, uid: str) -> None:
-        self.hide_banners()
+        self.prep()
         card = self.page.locator(f"{SEL['req_item']}[data-entity-id='{uid}']").first
         name = ""
         try:
             name = norm(card.locator(SEL["req_name"]).first.inner_text(timeout=1000))
         except Exception:
             pass
-        try:
-            card.locator(SEL["req_accept"]).first.click(timeout=5000)
-        except Exception as e:
-            if browser.is_closed_error(e):
+        aim = self.aim(f"{SEL['req_item']}[data-entity-id='{uid}'] button.js-entity-accept")
+        if aim.get("err") or aim.get("blocked"):
+            return self.not_confirmed(uid, f"кнопка «Принять» {'перекрыта' if aim.get('blocked') else 'не нашлась'} "
+                                           f"для {name} ({uid})", over=aim.get("blocked") or aim.get("err"))
+        for attempt in range(2):
+            try:
+                card.locator(SEL["req_accept"]).first.click(timeout=4000)
+                break
+            except Stopped:
                 raise
-            return self.not_confirmed(uid, f"кнопка «Принять» не нажалась для {name} ({uid})")
+            except Exception as e:
+                if browser.is_closed_error(e):
+                    raise
+                # чаще всего клик перехватила всплывашка, выскочившая после прицеливания
+                over = self.over()
+                if attempt:
+                    return self.not_confirmed(uid, f"кнопка «Принять» не нажалась для {name} ({uid})", over=over)
+                self.log(f"«Принять» не нажалось ({over}) — закрываю всплывашки и жму ещё раз")
+                self.prep()
+                self.aim(f"{SEL['req_item']}[data-entity-id='{uid}'] button.js-entity-accept")
         # успех: на карточке «Заявка принята» или кнопка исчезла (или исчезла сама карточка)
         end = time.monotonic() + CONFIRM_S
         nobutton_since = None
@@ -388,7 +703,7 @@ class AcceptRun(Session):
                     self.log(f"ОК: «{dlg[:150]}»; скриншот {self.screenshot('limit')}")
                     self.finish(MSG_CEILING)
                 if PERSON_LIMIT.search(dlg):
-                    return self.person_limit(uid, name)
+                    return self.person_limit(uid, name, norm(dlg))
             try:
                 st = self.page.evaluate(JS_REQ_STATE, [SEL["req_item"], uid, SEL["req_done_text"]])
             except Exception as e:
@@ -396,7 +711,7 @@ class AcceptRun(Session):
                     raise
                 continue
             if st["s"] in ("done", "gone"):
-                self.confirmed()
+                self.confirmed(uid)
                 self.log(f"принята заявка: {name} ({uid}); заявок по счётчику {self.counter()}")
                 return
             if st["s"] == "error":
@@ -405,13 +720,13 @@ class AcceptRun(Session):
                     self.log(f"ОК: «{text}»; скриншот {self.screenshot('limit')}")
                     self.finish(MSG_CEILING)
                 if PERSON_LIMIT.search(text):
-                    return self.person_limit(uid, name)
+                    return self.person_limit(uid, name, text)
                 return self.not_confirmed(uid, f"ОК ответил ошибкой «{text}» для {name} ({uid})")
             if st["s"] == "nobutton":
                 # кнопка пропала, а надписи нет: даём ОК секунду показать ошибку, иначе это успех
                 nobutton_since = nobutton_since or time.monotonic()
                 if time.monotonic() - nobutton_since >= 1.0:
-                    self.confirmed()
+                    self.confirmed(uid)
                     self.log(f"принята заявка: {name} ({uid}) (кнопка исчезла); заявок по счётчику {self.counter()}")
                     return
         # ответа нет: может, ОК сказал о лимите не окном, а новой надписью где-то на странице
@@ -419,32 +734,43 @@ class AcceptRun(Session):
         if OWN_LIMIT.search(text):
             self.log(f"скриншот {self.screenshot('limit')}")
             self.finish(MSG_CEILING)
-        if len(PERSON_LIMIT.findall(text)) > self.limit_seen:
-            return self.person_limit(uid, name)
+        found = PERSON_LIMIT.findall(text)
+        if len(found) > self.limit_seen:
+            return self.person_limit(uid, name, "надпись на странице: " + found[-1])
+        over = self.over()
         self.close_dialogs()
-        self.not_confirmed(uid, f"после «Принять» нет «{SEL['req_done_text']}» для {name} ({uid})")
+        self.not_confirmed(uid, f"после «Принять» нет «{SEL['req_done_text']}» для {name} ({uid})", over=over)
 
     def run(self) -> None:
         self.log(f"старт приёма (быстрый режим): лимит за запуск {self.limit}, пауза "
                  f"{PAUSE[0]}–{PAUSE[1]} с, сегодня уже {self.today_done()}")
         self.status(f"Принимаю заявки (лимит за запуск {self.limit})")
         self.resolve_urls()
+        first = True
         while True:
             self.guard()
+            say = first or self.reload_now == "recount"
+            self.note_reload()
             if not self.open_list():
                 self.finish("Заявки кончились")
+            # свой потолок: перед стартом и после каждой перезагрузки (в журнал — на старте и раз в 100 принятий)
+            self.check_own_cap(say)
+            first = False
             uids = self.visible_uids()
             if not uids and self.load_more(SEL["req_item"]):
                 uids = self.visible_uids()
+            if not uids and self.retry_left():
+                continue
             if not uids:
                 left = f": остались пропущенные ({len(self.skipped)})" if self.skipped else ""
                 self.finish("Заявки кончились" + left)
             for uid in uids:
                 self.guard()
                 self.accept_one(uid)
-                self.handled.add(uid)
                 self.status(f"Принимаю заявки: за запуск {self.done_run} из {self.limit}, сегодня {self.today_done()}")
                 self.pause()
+                if self.reload_now:
+                    break
 
 
 # ======================= УДАЛЕНИЕ ДРУЗЕЙ =======================
@@ -472,20 +798,30 @@ class DeleteRun(Session):
             wait(2, self.stop)
             return self.open_list()
         self.not_found = 0
-        self.hide_banners()
+        self.after_reload()
+        self.prep()
         return True
 
     def counter(self) -> str:
         try:
-            return norm(self.page.locator(SEL["fr_counter"]).first.inner_text(timeout=1000))
-        except Exception:
+            self.own_friends()
+            return self.own_count if self.own_count != "не виден" else "?"
+        except Exception as e:
+            if browser.is_closed_error(e):
+                raise
             return "?"
 
     def visible_uids(self) -> list:
-        items = self.page.locator(SEL["fr_item"])
+        """Только карточки из списка своих друзей (контейнер MyFriendsSquareCardsPagingB); блок «Возможно, вы
+        знакомы» и карточки с «Добавить в друзья» не берутся никогда."""
+        try:
+            ids = self.page.evaluate(JS_FR_UIDS, SEL["fr_item"])
+        except Exception as e:
+            if browser.is_closed_error(e):
+                raise
+            ids = []
         out = []
-        for i in range(items.count()):
-            uid = items.nth(i).get_attribute("data-id") or ""
+        for uid in ids:
             if not uid or uid in self.handled or uid in self.skipped:
                 continue
             if uid in self.keep or f"https://ok.ru/profile/{uid}" in self.keep:
@@ -494,7 +830,7 @@ class DeleteRun(Session):
         return out
 
     def delete_one(self, uid: str) -> None:
-        self.hide_banners()
+        self.prep()
         card = self.page.locator(f"{SEL['fr_item']}[data-id='{uid}']").first
         name = ""
         try:
@@ -504,7 +840,7 @@ class DeleteRun(Session):
         who = f"{name} ({uid})"
         # 1) навести на аватар — всплывает меню; не всплыло — отвести мышь и навести ещё раз.
         #    Меню ищем по имени человека: иначе можно взять ещё не спрятанное меню предыдущего друга
-        avatar = card.locator(SEL["fr_avatar"]).first
+        avatar_sel = f"{SEL['fr_item']}[data-id='{uid}'] {SEL['fr_avatar']}"
         if name:
             # textContent меню: имя может слипаться со следующей строкой; «Друг 1» ≠ «Друг 10»
             head = re.compile(r"^\s*" + r"\s+".join(map(re.escape, name.split())) + r"(?![0-9a-zа-яё])")
@@ -512,17 +848,22 @@ class DeleteRun(Session):
         else:
             item = self.page.locator(SEL["fr_menu_remove"]).first
         shown = False
+        blocked = None
         for attempt in range(2):
             try:
-                avatar.scroll_into_view_if_needed(timeout=3000)
                 if attempt:
                     self.page.mouse.move(5, 5)
-                # мышью в центр аватара, а не avatar.hover(): всплывшее меню перекрывает аватар,
-                # и hover() ждал бы, пока под мышью снова окажется аватар
-                ab = avatar.bounding_box()
-                if not ab:
-                    raise LookupError("аватар без координат")
-                self.page.mouse.move(ab["x"] + ab["width"] / 2, ab["y"] + ab["height"] / 2, steps=4)
+                    wait(0.3, self.stop)
+                    self.prep()
+                # карточку в середину окна, точка на аватаре, которую ничто не перекрывает; мышью туда, а не
+                # avatar.hover(): всплывшее меню перекрывает аватар, и hover() ждал бы, пока под мышью снова аватар
+                aim = self.aim(avatar_sel)
+                if aim.get("err"):
+                    raise LookupError(aim["err"])
+                if aim.get("blocked"):
+                    blocked = aim["blocked"]
+                    continue
+                self.page.mouse.move(aim["x"], aim["y"], steps=4)
                 item.wait_for(state="visible", timeout=3000)
                 shown = True
                 break
@@ -532,13 +873,30 @@ class DeleteRun(Session):
                 if browser.is_closed_error(e):
                     raise
         if not shown:
-            return self.not_confirmed(uid, f"меню «Прекратить дружбу» не появилось для {who}")
+            return self.not_confirmed(uid, f"меню «Прекратить дружбу» не появилось для {who}", over=blocked)
         self.shot(f"menu_{uid}")
-        # 2) пункт меню — клик по координатам (меню прячется, если мышь уходит в сторону)
-        box = item.bounding_box()
+        # 2) пункт меню — клик по координатам (меню прячется, если мышь уходит в сторону); точку проверяем:
+        #    поверх пункта не должно лежать ничего чужого
+        try:
+            box = item.bounding_box(timeout=2000)
+        except Exception as e:
+            if browser.is_closed_error(e):
+                raise
+            box = None      # меню успело спрятаться
         if not box:
             return self.not_confirmed(uid, f"пункт «Прекратить дружбу» без координат для {who}")
-        self.page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=4)
+        px, py = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        self.last_point, self.last_target = (px, py), None
+        try:
+            free = item.evaluate("(e, [x, y]) => { const t = document.elementFromPoint(x, y); return !!t && (t === e || e.contains(t)); }",
+                                 [px, py])
+        except Exception as e:
+            if browser.is_closed_error(e):
+                raise
+            free = True
+        if not free:
+            return self.not_confirmed(uid, f"пункт «Прекратить дружбу» перекрыт для {who}")
+        self.page.mouse.move(px, py, steps=4)
         self.page.mouse.down()
         self.page.mouse.up()
         # 3) окно подтверждения именно для этого человека → «Прекратить»
@@ -550,8 +908,10 @@ class DeleteRun(Session):
         except Exception as e:
             if browser.is_closed_error(e):
                 raise
+            over = self.over()
             self.close_dialogs()
-            return self.not_confirmed(uid, f"окно подтверждения не появилось или «Прекратить» не нажалось для {who}")
+            return self.not_confirmed(uid, f"окно подтверждения не появилось или «Прекратить» не нажалось для {who}",
+                                      over=over)
         # 4) успех — окно подтверждения закрылось; ОК на его месте показывает «Этот человек удалён из
         #    списка ваших друзей» с кнопкой «Закрыть» — его закрываем, иначе оно перекроет следующие карточки
         end = time.monotonic() + CONFIRM_S
@@ -559,7 +919,7 @@ class DeleteRun(Session):
             wait(0.25, self.stop)
             try:
                 if not self.page.locator(SEL["fr_confirm"]).first.is_visible():
-                    self.confirmed()
+                    self.confirmed(uid)
                     done = SEL["fr_done_text"] in norm(self.dialog_text())
                     self.log(f"удалён из друзей: {who}{'' if done else ' (окно закрылось без надписи)'}; "
                              f"друзей по счётчику {self.counter()}")
@@ -572,8 +932,9 @@ class DeleteRun(Session):
             except Exception as e:
                 if browser.is_closed_error(e):
                     raise
+        over = self.over()
         self.close_dialogs()
-        self.not_confirmed(uid, f"окно подтверждения не закрылось после «Прекратить» для {who}")
+        self.not_confirmed(uid, f"окно подтверждения не закрылось после «Прекратить» для {who}", over=over)
 
     def close_result(self) -> None:
         """Закрыть окно «удалён из списка ваших друзей»: «Закрыть» → Escape → перезагрузка списка."""
@@ -588,7 +949,7 @@ class DeleteRun(Session):
                     self.page.keyboard.press("Escape")
                 else:
                     self.log("окно «удалён из списка» не закрылось, перезагружаю список")
-                    self.need_reload = True
+                    self.reload_now = self.reload_now or "result"
                     return
             except Stopped:
                 raise
@@ -604,23 +965,24 @@ class DeleteRun(Session):
         self.resolve_urls()
         while True:
             self.guard()
+            self.note_reload()
             if not self.open_list():
                 self.finish("Друзья кончились")
             uids = self.visible_uids()
             if not uids and self.load_more(SEL["fr_item"]):
                 uids = self.visible_uids()
+            if not uids and self.retry_left():
+                continue
             if not uids:
-                total = self.page.locator(SEL["fr_item"]).count()
+                total = len(self.page.evaluate(JS_FR_UIDS, SEL["fr_item"]))
                 self.finish(f"Список пройден: осталось {total}, их не трогаем "
                             f"(do_not_delete.txt или не подтвердилось)")
-            self.need_reload = False
             for uid in uids:
                 self.guard()
                 self.delete_one(uid)
-                self.handled.add(uid)
                 self.status(f"Удаляю друзей: за запуск {self.done_run} из {self.limit}, сегодня {self.today_done()}")
                 self.pause()
-                if self.need_reload:
+                if self.reload_now:
                     break
 
 

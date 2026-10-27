@@ -1,7 +1,8 @@
-"""Проверка быстрого режима v0.2.0 через настоящее окно программы (кнопки нажимаются .invoke()).
+"""Проверка быстрого режима (v0.2.0–v0.2.1) через настоящее окно программы (кнопки нажимаются .invoke()).
 
   python tools/test_fast.py mock   — сухой прогон на макете ОК (tools/mock_ok.py) в отдельной папке,
                                      файлы программы и аккаунт «Павел.» не трогаются
+  python tools/test_fast.py mocknew — только сценарии v0.2.1 (всплывашки, рекомендации, шапка, 6000, перезагрузки)
   python tools/test_fast.py real   — аккаунт «Павел.» на настоящем ok.ru: вход, приём, удаление, «Стоп»,
                                      отметка инцидента и «Сбросить и продолжить»
   python tools/test_fast.py realdel N — аккаунт «Павел.»: живое удаление N друзей (лимит за запуск = N)
@@ -9,6 +10,7 @@
                                      должна остановиться на предупреждении Chrome и не обходить его
 """
 import json
+import re
 import os
 import queue
 import shutil
@@ -17,6 +19,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -26,7 +29,7 @@ SCENARIO = sys.argv[1] if len(sys.argv) > 1 else "mock"
 PORT = 8765
 MOCK = f"http://127.0.0.1:{PORT}"
 
-if SCENARIO == "mock":
+if SCENARIO in ("mock", "mocknew"):
     base = Path(os.environ.get("OKF_TEST_BASE", "/tmp/okf_fast_test"))
     if base.exists():
         shutil.rmtree(base)
@@ -117,6 +120,11 @@ def log_text(acc=ACC):
     return p.read_text(encoding="utf-8") if p.exists() else ""
 
 
+def unconfirmed_people(text):
+    """Кто не подтвердился (id), без повторов: v0.2.1 даёт пропущенным ещё одну попытку после перезагрузки."""
+    return set(re.findall(r"не подтверждено \(.*?\((\d+)\);", text))
+
+
 def counters(acc=ACC):
     return store.load_counters(acc)
 
@@ -152,8 +160,8 @@ def scenario_mock(d: Driver):
     check("в журнале «пропуск: у человека максимум друзей» ×2 (окно и надпись)",
           lt.count("пропуск: у человека максимум друзей") == 2, str(lt.count("пропуск: у человека максимум друзей")))
     check("окно «максимум друзей» закрыто (крестик/Escape)", "модальн" not in s)
-    check("в журнале «не подтверждено» ×2 (молчание и ошибка ОК)", lt.count("не подтверждено (") == 2,
-          str(lt.count("не подтверждено (")))
+    check("«не подтверждено» у 2 человек (молчание и ошибка ОК)", unconfirmed_people(lt) == {"1018", "1027"},
+          str(sorted(unconfirmed_people(lt))))
     check("в журнале снята отметка прошлой версии", "отметка инцидента прошлой версии" in lt)
     times = [t for t, _id, k in st["accept_log"]]
     gaps = [b - a for a, b in zip(times, times[1:]) if b - a < 4]
@@ -189,19 +197,27 @@ def scenario_mock(d: Driver):
           str(store.account_settings(ACC)["run_limit"]))
     store.update_account(ACC, run_limit=6000)
 
-    print("4) 10 неподтверждённых подряд")
+    print("4) ОК молчит на всё: 3 неподтверждённых → перезагрузка; 3 перезагрузки без успеха → остановка")
     mock("/ctl?reset=1&silent_all=1")
+    log0 = len(log_text())
     d.press("btn_accept")
-    s = d.wait_status(lambda s: "подряд не подтвердились" in s, 180)
-    n = len(mock("/state")["accept_log"])
-    check("остановка после 10 неподтверждённых", s == modes.MSG_UNCONFIRMED and n == 10, f"{s}; нажатий {n}")
+    s = d.wait_status(lambda s: s == modes.MSG_STUCK, 240)
+    st = mock("/state")
+    n = len(st["accept_log"])
+    lt = log_text()[log0:]
+    check("остановка «Не получается продолжить…» после 3 перезагрузок, 12 нажатий", s == modes.MSG_STUCK and n == 12,
+          f"{s}; нажатий {n}")
+    check("в журнале 3 перезагрузки восстановления и причина остановки",
+          lt.count("перезагружаю страницу (перезагрузка") == 3 and "после 3 перезагрузок подряд" in lt,
+          f"перезагрузок {lt.count('перезагружаю страницу (перезагрузка')}")
+    check("в журнале у неподтверждённых — что поверх точки", lt.count("поверх точки: ") >= 12)
     mock("/ctl?silent_all=0")
 
     print("5) лимит у нас самих («Вы достигли максимального количества друзей»)")
     mock("/ctl?reset=1&own_limit=1")
     d.press("btn_accept")
     s = d.wait_status(lambda s: s == modes.MSG_CEILING, 60)
-    check("остановка «Похоже, достигнут потолок друзей ОК…»", s == modes.MSG_CEILING, s)
+    check("остановка «Друзей уже около 6000…»", s == modes.MSG_CEILING, s)
     mock("/ctl?own_limit=0")
 
     print("6) капча → отметка → кнопка «Принять» не идёт → «Сбросить и продолжить»")
@@ -265,6 +281,106 @@ def scenario_mock(d: Driver):
     a = d.wait_status(lambda s: s == "Остановлено", 15)
     b = d.wait_status(lambda s: s == "Остановлено", 15, acc=ACC + " 2")
     check("«Стоп всё» остановил оба", a == "Остановлено" and b == "Остановлено", f"{a} / {b}")
+
+
+# ---------------------------------------------------------------- сухой прогон v0.2.1
+def scenario_mock_new(d: Driver):
+    store.update_account(ACC, run_limit=6000)
+    d.ui(d.app._load_accounts)
+    keep = paths.DO_NOT_DELETE.read_text(encoding="utf-8") if paths.DO_NOT_DELETE.exists() else ""
+    if "/2015" not in keep:
+        with paths.DO_NOT_DELETE.open("a", encoding="utf-8") as f:
+            f.write("https://ok.ru/profile/2015\n")
+
+    def run(button, ctl, pred, timeout=300):
+        d.idle(timeout=900)
+        mock("/ctl?reset=1&" + ctl)
+        log0 = len(log_text())
+        d.ui(lambda: d.app._status.__setitem__(ACC, ""))   # статус прошлого сценария не должен сойти за итог
+        d.press(button)
+        s = d.wait_status(pred, timeout)
+        d.idle()
+        return s, mock("/state"), log_text()[log0:]
+
+    accept_end = lambda s: s.startswith("Заявки кончились") or s in (modes.MSG_STUCK, modes.MSG_CEILING) or s.startswith("Ошибка")
+    delete_end = lambda s: s.startswith("Список пройден") or s.startswith("Друзья кончились") or s == modes.MSG_STUCK \
+        or s.startswith("Ошибка")
+
+    print("10) всплывашка «… хочет с вами подружиться» каждые 2 действия поверх верхних карточек — приём")
+    s, st, lt = run("btn_accept", "toast=2", accept_end)
+    ok_n = sum(1 for r in st["reqs"] if r["done"])
+    check("приём дошёл до конца: 41 принята, «остались пропущенные (4)»",
+          ok_n == 41 and s == "Заявки кончились: остались пропущенные (4)", f"{s}; принято {ok_n}")
+    check("«Принять» во всплывашке не нажато ни разу", st["toast_accept"] == 0,
+          f"всплывашек {st['toast_shown']}, «Принять» в них {st['toast_accept']}, закрыто крестиком {st['toast_closed']}")
+    check("незнакомые всплывашки закрыты крестиком и записаны в журнал",
+          st["toast_closed"] >= 1 and "закрыто всплывающее уведомление ОК" in lt, f"в журнале {lt.count('закрыто всплывающее')}")
+    check("не подтвердились только 2 человека (молчание и ошибка ОК)", unconfirmed_people(lt) == {"1018", "1027"},
+          str(sorted(unconfirmed_people(lt))))
+
+    print("11) всплывашки каждые 3 действия + 120 друзей по 100 на странице: удаление и профилактические перезагрузки")
+    s, st, lt = run("btn_delete", "nfr=120&fr_page=100&toast=3", delete_end, 900)
+    gone = sum(1 for f in st["friends"] if f["gone"])
+    check("удалено 117 из 120 (остались молчащий, без меню, do_not_delete)", gone == 117 and s.startswith("Список пройден: осталось 3"),
+          f"{s}; удалено {gone}")
+    check("«Принять» во всплывашке не нажато ни разу", st["toast_accept"] == 0,
+          f"всплывашек {st['toast_shown']}, «Принять» в них {st['toast_accept']}, закрыто крестиком {st['toast_closed']}")
+    prof = lt.count("профилактическая перезагрузка страницы после")
+    check("профилактическая перезагрузка каждые 30–50 удалений", prof >= 2 and all(
+        30 <= int(l.split("после ")[1].split()[0]) <= 50 for l in lt.splitlines() if "профилактическая" in l), f"{prof} раз")
+    check("не подтвердились только 2 человека (молчит, без меню)", unconfirmed_people(lt) == {"2004", "2009"},
+          str(sorted(unconfirmed_people(lt))))
+
+    print("12) блок «Возможно, вы знакомы» с «Добавить в друзья» над списком (и одна такая карточка в самом списке)")
+    s, st, lt = run("btn_delete", "rec=2", delete_end)
+    gone = sum(1 for f in st["friends"] if f["gone"])
+    check("удалено 27, «Список пройден: осталось 3»", gone == 27 and s.startswith("Список пройден: осталось 3"), f"{s}; удалено {gone}")
+    check("«Добавить в друзья» не нажато, рекомендации не тронуты",
+          st["rec_add"] == 0 and not any(str(i).startswith("3") for _t, i, _k in st["unfriend_log"]) and "Рекомендация" not in lt,
+          f"«Добавить» {st['rec_add']}")
+
+    print("13) высокая шапка: верхний ряд карточек частично под ней")
+    s, st, lt = run("btn_delete", "header=1", delete_end)
+    gone = sum(1 for f in st["friends"] if f["gone"])
+    check("удалено 27, не подтвердились только 2 человека", gone == 27 and unconfirmed_people(lt) == {"2004", "2009"},
+          f"{s}; удалено {gone}; не подтверждены {sorted(unconfirmed_people(lt))}")
+
+    print("14) свой потолок 6000")
+    for text in ("6K", "5\xa0995"):
+        s, st, lt = run("btn_accept", "fr_text=" + urllib.parse.quote(text), accept_end, 60)
+        check(f"счётчик «{text}» — приём не начат, «{modes.MSG_CEILING}»", s == modes.MSG_CEILING and not st["accept_log"],
+              f"{s}; нажатий {len(st['accept_log'])}")
+    check("в журнале прочитанный счётчик", "своих друзей по счётчику: 5 995" in lt, [l for l in lt.splitlines() if "счётчику" in l][:1])
+    s, st, lt = run("btn_accept", "fr_base=1000&limit_after=3", accept_end, 120)
+    check("3 окна «максимальное количество друзей» подряд — стоп, 6 нажатий",
+          s == modes.MSG_CEILING and len(st["accept_log"]) == 6 and "подряд — считаю, что это наш потолок" in lt,
+          f"{s}; нажатий {len(st['accept_log'])}")
+    s, st, lt = run("btn_accept", "fr_base=5945", accept_end, 120)
+    ok_n = sum(1 for r in st["reqs"] if r["done"])
+    check("счётчик 5975 → приём; после перезагрузки 5992 — стоп (17 принято)", s == modes.MSG_CEILING and ok_n == 17,
+          f"{s}; принято {ok_n}")
+
+    print("15) после 7 действий на странице меню и «Принять» перестают работать (как у друга) — перезагрузка лечит")
+    s, st, lt = run("btn_delete", "nfr=60&stale_after=7", delete_end, 900)
+    gone = sum(1 for f in st["friends"] if f["gone"])
+    rec = lt.count("перезагружаю страницу (перезагрузка 1 из 3")
+    check("удалено 57 из 60, «Список пройден: осталось 3»", gone == 57 and s.startswith("Список пройден: осталось 3"),
+          f"{s}; удалено {gone}; перезагрузок восстановления {rec}")
+    check("перезагрузки восстановления были", rec >= 3, str(rec))
+    s, st, lt = run("btn_accept", "stale_after=7", accept_end, 900)
+    ok_n = sum(1 for r in st["reqs"] if r["done"])
+    check("приём: 41 принята, «остались пропущенные (4)»", ok_n == 41 and s == "Заявки кончились: остались пропущенные (4)",
+          f"{s}; принято {ok_n}; перезагрузок {lt.count('перезагружаю страницу (перезагрузка')}")
+
+    print("16) меню не всплывает ни у кого: 3 перезагрузки без успеха → остановка")
+    s, st, lt = run("btn_delete", "nomenu_all=1", delete_end, 300)
+    check(f"«{modes.MSG_STUCK}», ни одного «Прекратить»", s == modes.MSG_STUCK and not st["unfriend_log"],
+          f"{s}; загрузок списка {st['loads']['friends']}")
+    check("3 перезагрузки восстановления, в журнале — что поверх точки наведения",
+          lt.count("перезагружаю страницу (перезагрузка") == 3 and "поверх точки: сама цель (div.user-grid-card_img" in lt,
+          [l for l in lt.splitlines() if "поверх точки" in l][:1])
+    shots = [p.name for p in paths.SCREENSHOTS.iterdir() if p.name.endswith("_recover.png")]
+    check("скриншоты перед перезагрузками", len(shots) >= 3, str(len(shots)))
 
 
 # ---------------------------------------------------------------- настоящий ok.ru
@@ -355,7 +471,7 @@ def scenario_cert(d: Driver):
 
 def main():
     srv = None
-    if SCENARIO == "mock":
+    if SCENARIO in ("mock", "mocknew"):
         sys.path.insert(0, str(ROOT / "tools"))
         import mock_ok
         srv = mock_ok.serve(PORT)
@@ -366,7 +482,7 @@ def main():
 
     def run():
         try:
-            {"mock": scenario_mock, "real": scenario_real, "realdel": scenario_realdel, "cert": scenario_cert}[SCENARIO](d)
+            {"mock": lambda d: (scenario_mock(d), scenario_mock_new(d)), "mocknew": scenario_mock_new, "real": scenario_real, "realdel": scenario_realdel, "cert": scenario_cert}[SCENARIO](d)
         except Exception:
             traceback.print_exc()
             check("сценарий без исключений", False)

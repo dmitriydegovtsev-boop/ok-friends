@@ -14,7 +14,7 @@ from .worker import AccountDriver
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("OK-Friends v0.2.0 — заявки и друзья в Одноклассниках")
+        root.title("OK-Friends v0.2.1 — заявки и друзья в Одноклассниках")
         root.geometry("980x620")
         root.minsize(860, 560)
         paths.ensure_dirs()
