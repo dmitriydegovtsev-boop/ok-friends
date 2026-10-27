@@ -30,7 +30,8 @@ def hover(page, label):
         page.mouse.move(5, 5)
         page.mouse.move(b["x"] + 60, b["y"] + 60, steps=4)
         try:
-            page.locator(f".user-grid-card[data-id='{uid}'] .sc-menu:not(.sc-menu__hidden) a.u-menu_a").wait_for(
+            # меню в макете с v0.2.2 — как на ОК: не в карточке, а новое в общем #hook_Block_ShortcutMenu
+            page.locator(f"#hook_Block_ShortcutMenu .sc-menu[data-uid='{uid}']:not(.sc-menu__hidden) a.u-menu_a").first.wait_for(
                 state="visible", timeout=3000)
             got.append(True)
         except Exception:
